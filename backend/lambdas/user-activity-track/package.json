@@ -1,0 +1,7 @@
+{
+  "name": "upply-user-activity-track-lambda",
+  "version": "1.0.0",
+  "description": "UPply /activity (POST) — writes save/unsave/apply events to UserActivity table",
+  "type": "module",
+  "main": "index.mjs"
+}

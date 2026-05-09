@@ -1,0 +1,7 @@
+{
+  "name": "upply-jobs-lambda",
+  "version": "1.0.0",
+  "description": "UPply /jobs endpoint — routes to JSearch (global) or CareerJet (Israel)",
+  "type": "module",
+  "main": "index.mjs"
+}

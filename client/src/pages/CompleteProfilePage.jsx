@@ -8,6 +8,7 @@ function CompleteProfilePage() {
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [phone, setPhone] = useState("");
+  const [location, setLocation] = useState("");
 
   const [errorMessage, setErrorMessage] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -34,6 +35,7 @@ function CompleteProfilePage() {
           phone: phone,
           first_name: firstName,
           last_name: lastName,
+          location: location,
         }),
       });
 
