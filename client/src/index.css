@@ -109,3 +109,16 @@ code {
   padding: 4px 8px;
   background: var(--code-bg);
 }
+
+/* Skeleton loading shimmer — used by SkeletonCard in HomePage */
+@keyframes upply-shimmer {
+  0%   { background-position: -600px 0; }
+  100% { background-position:  600px 0; }
+}
+.skeleton-shimmer {
+  background: linear-gradient(90deg, #ececec 25%, #e0e0e0 50%, #ececec 75%);
+  background-size: 1200px 100%;
+  animation: upply-shimmer 1.5s ease-in-out infinite;
+  border-radius: 6px;
+  display: block;
+}

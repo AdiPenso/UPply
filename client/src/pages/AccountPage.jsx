@@ -2,7 +2,25 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
-import { getProfile, getActivity, updateProfile } from "../services/api";
+import { getProfile, getActivity, updateProfile, updateActivityStatus, deleteActivity } from "../services/api";
+
+// ── Activity status options ───────────────────────────────────────────────────
+const STATUS_OPTIONS = [
+  { value: "applied",   label: "📤 Just Applied" },
+  { value: "interview", label: "🎤 In Interview" },
+  { value: "offer",     label: "📋 Offer Received" },
+  { value: "accepted",  label: "✅ Accepted" },
+  { value: "rejected",  label: "❌ Rejected" },
+];
+
+// Background / text / border per status — used to tint the select element
+const STATUS_STYLE = {
+  applied:   { background: "#fef3c7", color: "#92400e", borderColor: "#fde68a" },
+  interview: { background: "#dbeafe", color: "#1e40af", borderColor: "#93c5fd" },
+  offer:     { background: "#d1fae5", color: "#065f46", borderColor: "#6ee7b7" },
+  accepted:  { background: "#f0fdf4", color: "#166534", borderColor: "#86efac" },
+  rejected:  { background: "#fee2e2", color: "#991b1b", borderColor: "#fca5a5" },
+};
 
 // Fields we count toward "Profile strength"
 const STRENGTH_FIELDS = [
@@ -39,7 +57,17 @@ export default function AccountPage() {
   const [userId, setUserId] = useState("");
   const [email, setEmail] = useState("");
   const [profile, setProfile] = useState(null);
+  // cachedName is read from localStorage instantly so the hero never shows a
+  // wrong/derived name while the DynamoDB fetch is in-flight.
+  const [cachedName, setCachedName] = useState({ first: "", last: "" });
   const [activity, setActivity] = useState({ saved: [], applied: [] });
+  const [activeTab, setActiveTab] = useState("profile");
+  // Filter inside the Activity History tab
+  const [activityFilter, setActivityFilter] = useState("all");
+  const [statusNotice, setStatusNotice] = useState("");
+  // Custom confirm modal — replaces window.confirm for delete / reject actions
+  // Shape: { message, confirmLabel, onConfirm } | null
+  const [confirmModal, setConfirmModal] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState("");
   const [saveNotice, setSaveNotice] = useState("");
@@ -82,6 +110,12 @@ export default function AccountPage() {
         return;
       }
 
+      // Read the locally-cached name immediately so the hero shows the right
+      // name while the DynamoDB fetch is in-flight — no flicker, no wrong name.
+      const cacheKey = `upply_name_${sub}`;
+      const cached = JSON.parse(localStorage.getItem(cacheKey) || "null");
+      if (cached) setCachedName(cached);
+
       // Profile (Users table) and activity (UserActivity table) are independent — fetch in parallel
       const [raw, act] = await Promise.all([
         getProfile(sub).catch(() => null),
@@ -103,6 +137,14 @@ export default function AccountPage() {
         const data = raw?.Item || raw?.profile || raw || {};
         console.log("Loaded profile from DynamoDB:", data);
         setProfile(data);
+
+        // Write the authoritative name to the cache so every page sees it instantly.
+        if (data.first_name || data.last_name) {
+          const nameEntry = { first: data.first_name || "", last: data.last_name || "" };
+          localStorage.setItem(cacheKey, JSON.stringify(nameEntry));
+          setCachedName(nameEntry);
+        }
+
         setForm((f) => ({
           ...f,
           first_name: data.first_name || "",
@@ -157,7 +199,17 @@ export default function AccountPage() {
     setSaveNotice("Saving…");
     try {
       const data = await updateProfile(userId, cleaned);
-      if (data.profile) setProfile(data.profile);
+      if (data.profile) {
+        setProfile(data.profile);
+        // Keep the name cache in sync so HomePage shows the new name instantly.
+        const updatedFirst = data.profile.first_name || cleaned.first_name || "";
+        const updatedLast  = data.profile.last_name  || cleaned.last_name  || "";
+        if (updatedFirst || updatedLast) {
+          const nameEntry = { first: updatedFirst, last: updatedLast };
+          localStorage.setItem(`upply_name_${userId}`, JSON.stringify(nameEntry));
+          setCachedName(nameEntry);
+        }
+      }
       setSaveNotice("✅ Saved!");
       setTimeout(() => setSaveNotice(""), 2500);
     } catch (err) {
@@ -217,6 +269,81 @@ export default function AccountPage() {
     setSkills(skills.filter((x) => x !== s));
   };
 
+  // ── Activity status / delete handlers ────────────────────────────────────
+
+  const showStatusNotice = (msg) => {
+    setStatusNotice(msg);
+    setTimeout(() => setStatusNotice(""), 4000);
+  };
+
+  // Opens the custom confirm modal; `onConfirm` is called only if the user clicks the confirm button.
+  const openConfirm = (message, confirmLabel, onConfirm) =>
+    setConfirmModal({ message, confirmLabel, onConfirm });
+
+  const doDelete = async (item) => {
+    const kind = item.kind;
+    // Optimistic removal
+    setActivity((prev) => ({
+      ...prev,
+      [kind === "save" ? "saved" : "applied"]: (
+        kind === "save" ? prev.saved : prev.applied
+      ).filter((a) => a.activity_id !== item.activity_id),
+    }));
+    try {
+      await deleteActivity(userId, item.activity_id);
+      showStatusNotice("🗑️ Removed from history.");
+    } catch {
+      showStatusNotice("❌ Could not delete — please try again.");
+    }
+  };
+
+  const handleStatusChange = async (item, newStatus) => {
+    if (!item.activity_id) return;
+
+    // Rejected → show custom confirm modal, then delete on confirmation
+    if (newStatus === "rejected") {
+      openConfirm(
+        `Mark "${item.title || "this job"}" as rejected and remove it from your history?`,
+        "Yes, remove it",
+        () => doDelete({ ...item, kind: "apply" })
+      );
+      return;
+    }
+
+    // All other statuses — optimistic update, then API call
+    setActivity((prev) => ({
+      ...prev,
+      applied: prev.applied.map((a) =>
+        a.activity_id === item.activity_id ? { ...a, status: newStatus } : a
+      ),
+    }));
+
+    try {
+      await updateActivityStatus(userId, item.activity_id, newStatus);
+      if (newStatus === "accepted") {
+        showStatusNotice("🎉 Congratulations! Don't forget to update your profile title.");
+      }
+    } catch {
+      // Roll back on failure
+      setActivity((prev) => ({
+        ...prev,
+        applied: prev.applied.map((a) =>
+          a.activity_id === item.activity_id ? { ...a, status: item.status } : a
+        ),
+      }));
+      showStatusNotice("❌ Could not save status — please try again.");
+    }
+  };
+
+  const handleDeleteItem = (item) => {
+    if (!item.activity_id) return;
+    openConfirm(
+      `Remove "${item.title || "this job"}" from your history?`,
+      "Remove",
+      () => doDelete(item)
+    );
+  };
+
   const handleLogout = async () => {
     await signOut();
     navigate("/login");
@@ -231,23 +358,16 @@ export default function AccountPage() {
   };
   const strength = computeStrength(liveProfile);
 
-  // Derive a friendly fallback first name from the email when DB is empty
-  // (e.g. "adi.penso16@gmail.com" → "Adi")
-  const emailFirstName = email
-    ? (() => {
-        const raw = email.split("@")[0].split(/[._\d]/)[0];
-        return raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : "";
-      })()
-    : "";
-
-  // Hero always shows the SAVED state from DynamoDB — not the in-progress
-  // edits — so the user's identity is stable while they edit other fields.
-  const heroFirst = profile?.first_name || emailFirstName || "";
-  const heroLast = profile?.last_name || "";
+  // Hero: prefer the live DynamoDB value; fall back to the localStorage cache
+  // (available instantly, written after every successful DynamoDB load).
+  // We never derive a name from the email address — that was the source of the
+  // stale "Adi" appearing while "Liron" was already saved in DynamoDB.
+  const heroFirst = profile?.first_name || cachedName.first || "";
+  const heroLast  = profile?.last_name  || cachedName.last  || "";
   const displayName =
     [heroFirst, heroLast].filter(Boolean).join(" ") || "Your name";
 
-  const initial = (heroFirst || email || "U").charAt(0).toUpperCase();
+  const initial = (heroFirst || "U").charAt(0).toUpperCase();
 
   // Counts come from the UserActivity table (queried by /activity GET Lambda).
   // Interview count + response rate will come from the apply rows' `status` field
@@ -262,13 +382,42 @@ export default function AccountPage() {
     response_rate: null,
   };
 
-  // Merge recent activity (most recent 5 across saves + applies)
+  // Merge recent activity (most recent 5 across saves + applies) for sidebar card
   const recent = [
     ...activity.saved.map((j) => ({ ...j, kind: "save" })),
     ...activity.applied.map((j) => ({ ...j, kind: "apply" })),
   ]
     .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""))
     .slice(0, 5);
+
+  // Full activity history — last 6 months, newest-first, for the Activity tab
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  const allActivity = [
+    ...activity.saved.map((j) => ({ ...j, kind: "save" })),
+    ...activity.applied.map((j) => ({ ...j, kind: "apply" })),
+  ]
+    .filter((j) => !j.timestamp || new Date(j.timestamp) >= sixMonthsAgo)
+    .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+
+  // Counts per filter bucket (used for the filter-tab badges)
+  const filterCounts = {
+    all:       allActivity.length,
+    saved:     allActivity.filter((a) => a.kind === "save").length,
+    applied:   allActivity.filter((a) => a.kind === "apply" && (!a.status || a.status === "applied")).length,
+    interview: allActivity.filter((a) => a.status === "interview").length,
+    offer:     allActivity.filter((a) => a.status === "offer").length,
+  };
+
+  // The subset shown in the activity list, based on the selected filter tab
+  const filteredActivity = allActivity.filter((a) => {
+    if (activityFilter === "all")       return true;
+    if (activityFilter === "saved")     return a.kind === "save";
+    if (activityFilter === "applied")   return a.kind === "apply" && (!a.status || a.status === "applied");
+    if (activityFilter === "interview") return a.status === "interview";
+    if (activityFilter === "offer")     return a.status === "offer";
+    return true;
+  });
 
   return (
     <div style={styles.page}>
@@ -348,8 +497,149 @@ export default function AccountPage() {
       {errorMsg && <div style={styles.error}>{errorMsg}</div>}
       {isLoading && <div style={styles.loading}>Loading your profile…</div>}
 
-      {/* Two-column layout */}
-      <div style={styles.twoCol}>
+      {/* Tab bar */}
+      <div style={styles.tabBar}>
+        <button
+          style={{
+            ...styles.tabBtn,
+            ...(activeTab === "profile" ? styles.tabBtnActive : {}),
+          }}
+          onClick={() => setActiveTab("profile")}
+        >
+          👤 Profile
+        </button>
+        <button
+          style={{
+            ...styles.tabBtn,
+            ...(activeTab === "activity" ? styles.tabBtnActive : {}),
+          }}
+          onClick={() => setActiveTab("activity")}
+        >
+          📋 Activity History
+          {allActivity.length > 0 && (
+            <span style={styles.tabBadge}>{allActivity.length}</span>
+          )}
+        </button>
+      </div>
+
+      {/* Activity History tab */}
+      {activeTab === "activity" && (
+        <div style={styles.activityTabWrap}>
+          {/* Status notice (accepted toast, delete confirm, etc.) */}
+          {statusNotice && <div style={styles.statusNotice}>{statusNotice}</div>}
+
+          {/* Filter tabs */}
+          <div style={styles.filterBar}>
+            {[
+              { key: "all",       label: "All" },
+              { key: "saved",     label: "🔖 Saved" },
+              { key: "applied",   label: "📤 Applied" },
+              { key: "interview", label: "🎤 Interview" },
+              { key: "offer",     label: "📋 Offer" },
+            ].map(({ key, label }) => (
+              <button
+                key={key}
+                style={{
+                  ...styles.filterBtn,
+                  ...(activityFilter === key ? styles.filterBtnActive : {}),
+                }}
+                onClick={() => setActivityFilter(key)}
+              >
+                {label}
+                {filterCounts[key] > 0 && (
+                  <span style={styles.filterCount}>{filterCounts[key]}</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* List */}
+          {allActivity.length === 0 ? (
+            <div style={styles.activityTabEmpty}>
+              <p>No saves or applications in the last 6 months.</p>
+              <p style={{ marginTop: "8px", fontSize: "13px" }}>
+                Go to the{" "}
+                <span
+                  style={{ color: "#7c3aed", cursor: "pointer", textDecoration: "underline" }}
+                  onClick={() => navigate("/home")}
+                >
+                  job board
+                </span>{" "}
+                and start saving or applying!
+              </p>
+            </div>
+          ) : filteredActivity.length === 0 ? (
+            <div style={styles.activityTabEmpty}>
+              <p>No items in this category yet.</p>
+            </div>
+          ) : (
+            <div style={styles.activityList}>
+              {filteredActivity.map((item, i) => (
+                <div key={item.activity_id || i} style={styles.activityRow}>
+
+                  {/* Left: status badge (saved) or status select (applied) */}
+                  {item.kind === "save" ? (
+                    <div style={{ ...styles.activityBadge, background: "#e0e7ff", color: "#3730a3", borderColor: "#c7d2fe" }}>
+                      🔖 Saved
+                    </div>
+                  ) : (
+                    <select
+                      style={{
+                        ...styles.statusSelect,
+                        ...STATUS_STYLE[item.status] || STATUS_STYLE.applied,
+                      }}
+                      value={item.status || "applied"}
+                      onChange={(e) => handleStatusChange(item, e.target.value)}
+                    >
+                      {STATUS_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  )}
+
+                  {/* Middle: title + meta */}
+                  <div style={styles.activityRowBody}>
+                    <div style={styles.activityRowTitle}>
+                      {item.title || "Untitled position"}
+                    </div>
+                    <div style={styles.activityRowMeta}>
+                      {[item.company, item.location].filter(Boolean).join(" · ")}
+                    </div>
+                  </div>
+
+                  {/* Right: date + view link + delete */}
+                  <div style={styles.activityRowRight}>
+                    <div style={styles.activityRowDate}>
+                      {item.timestamp
+                        ? new Date(item.timestamp).toLocaleDateString("en-GB", {
+                            day: "numeric", month: "short", year: "numeric",
+                          })
+                        : "—"}
+                    </div>
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                      {item.job_url && (
+                        <a href={item.job_url} target="_blank" rel="noopener noreferrer" style={styles.activityRowLink}>
+                          View ↗
+                        </a>
+                      )}
+                      <button
+                        style={styles.deleteBtn}
+                        onClick={() => handleDeleteItem(item)}
+                        title="Remove from history"
+                      >
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Two-column layout — only shown on Profile tab */}
+      {activeTab === "profile" && <div style={styles.twoCol}>
         <div style={styles.colMain}>
           {/* Personal Info */}
           <Section icon="👤" title="Personal Info" onSave={savePersonal}>
@@ -582,7 +872,34 @@ export default function AccountPage() {
             </div>
           </Card>
         </div>
-      </div>
+      </div>}
+
+      {/* ── Custom confirm modal (replaces window.confirm) ── */}
+      {confirmModal && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modalCard}>
+            <div style={styles.modalIcon}>⚠️</div>
+            <p style={styles.modalMessage}>{confirmModal.message}</p>
+            <div style={styles.modalBtns}>
+              <button
+                style={styles.modalCancel}
+                onClick={() => setConfirmModal(null)}
+              >
+                Cancel
+              </button>
+              <button
+                style={styles.modalConfirm}
+                onClick={() => {
+                  setConfirmModal(null);
+                  confirmModal.onConfirm();
+                }}
+              >
+                {confirmModal.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1165,4 +1482,258 @@ const styles = {
   },
   accountKey: { color: "#6b7280", fontWeight: "600" },
   accountVal: { color: "#111827", fontFamily: "monospace" },
+
+  // ── Tab bar ────────────────────────────────────────────────────────────────
+  tabBar: {
+    maxWidth: "1100px",
+    margin: "0 auto 20px",
+    padding: "0 24px",
+    display: "flex",
+    gap: "8px",
+  },
+  tabBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    background: "#ffffff",
+    border: "1px solid #e5e7eb",
+    borderRadius: "10px",
+    padding: "9px 18px",
+    fontSize: "13px",
+    fontWeight: "600",
+    color: "#6b7280",
+    cursor: "pointer",
+    transition: "all 0.15s",
+  },
+  tabBtnActive: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    border: "1px solid transparent",
+    color: "#ffffff",
+    boxShadow: "0 3px 12px rgba(124,58,237,0.3)",
+  },
+  tabBadge: {
+    background: "rgba(255,255,255,0.25)",
+    borderRadius: "999px",
+    padding: "1px 7px",
+    fontSize: "11px",
+    fontWeight: "700",
+  },
+
+  // ── Activity tab ────────────────────────────────────────────────────────────
+  activityTabWrap: {
+    maxWidth: "1100px",
+    margin: "0 auto",
+    padding: "0 24px 40px",
+  },
+  activityTabHeading: {
+    fontSize: "15px",
+    fontWeight: "700",
+    color: "#1f2937",
+    margin: "0 0 16px",
+  },
+  activityTabEmpty: {
+    background: "#ffffff",
+    border: "1px solid #eef0f4",
+    borderRadius: "16px",
+    padding: "48px 24px",
+    textAlign: "center",
+    color: "#6b7280",
+    fontSize: "14px",
+  },
+  activityList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px",
+  },
+  activityRow: {
+    background: "#ffffff",
+    border: "1px solid #eef0f4",
+    borderRadius: "14px",
+    padding: "14px 18px",
+    display: "flex",
+    alignItems: "center",
+    gap: "14px",
+    boxShadow: "0 2px 6px rgba(0,0,0,0.03)",
+  },
+  activityBadge: {
+    flexShrink: 0,
+    fontSize: "11px",
+    fontWeight: "700",
+    padding: "4px 10px",
+    borderRadius: "999px",
+    border: "1px solid",
+    whiteSpace: "nowrap",
+  },
+  activityRowBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  activityRowTitle: {
+    fontSize: "14px",
+    fontWeight: "700",
+    color: "#111827",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  activityRowMeta: {
+    fontSize: "12px",
+    color: "#6b7280",
+    marginTop: "2px",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  activityRowRight: {
+    flexShrink: 0,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-end",
+    gap: "4px",
+  },
+  activityRowDate: {
+    fontSize: "12px",
+    color: "#9ca3af",
+    whiteSpace: "nowrap",
+  },
+  activityRowLink: {
+    fontSize: "12px",
+    color: "#7c3aed",
+    fontWeight: "600",
+    textDecoration: "none",
+  },
+  statusSelect: {
+    flexShrink: 0,
+    fontSize: "11px",
+    fontWeight: "700",
+    padding: "5px 10px",
+    borderRadius: "999px",
+    border: "1px solid",
+    cursor: "pointer",
+    outline: "none",
+    appearance: "none",       // hide default OS arrow
+    WebkitAppearance: "none",
+    backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b7280'/%3E%3C/svg%3E\")",
+    backgroundRepeat: "no-repeat",
+    backgroundPosition: "right 8px center",
+    paddingRight: "24px",
+  },
+  deleteBtn: {
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    fontSize: "15px",
+    opacity: 0.45,
+    padding: "2px 4px",
+    lineHeight: 1,
+    transition: "opacity 0.15s",
+  },
+  statusNotice: {
+    maxWidth: "1100px",
+    margin: "0 auto 12px",
+    padding: "10px 16px",
+    background: "#f0fdf4",
+    border: "1px solid #bbf7d0",
+    color: "#166534",
+    borderRadius: "10px",
+    fontSize: "13px",
+    fontWeight: "600",
+  },
+  // ── Filter bar ──────────────────────────────────────────────────────────────
+  filterBar: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "8px",
+    marginBottom: "16px",
+  },
+  filterBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "5px",
+    background: "#ffffff",
+    border: "1px solid #e5e7eb",
+    borderRadius: "999px",
+    padding: "6px 14px",
+    fontSize: "12px",
+    fontWeight: "600",
+    color: "#6b7280",
+    cursor: "pointer",
+  },
+  filterBtnActive: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    border: "1px solid transparent",
+    color: "#ffffff",
+    boxShadow: "0 2px 8px rgba(124,58,237,0.25)",
+  },
+  filterCount: {
+    background: "rgba(255,255,255,0.25)",
+    borderRadius: "999px",
+    padding: "1px 6px",
+    fontSize: "10px",
+    fontWeight: "700",
+  },
+
+  // ── Confirm modal ────────────────────────────────────────────────────────────
+  modalOverlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(0,0,0,0.45)",
+    backdropFilter: "blur(4px)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 1000,
+  },
+  modalCard: {
+    background: "#ffffff",
+    borderRadius: "20px",
+    padding: "36px 32px 28px",
+    maxWidth: "400px",
+    width: "90%",
+    boxShadow: "0 24px 60px rgba(0,0,0,0.2)",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: "16px",
+    textAlign: "center",
+  },
+  modalIcon: {
+    fontSize: "40px",
+    lineHeight: 1,
+  },
+  modalMessage: {
+    margin: 0,
+    fontSize: "15px",
+    color: "#374151",
+    lineHeight: 1.6,
+  },
+  modalBtns: {
+    display: "flex",
+    gap: "12px",
+    marginTop: "4px",
+    width: "100%",
+  },
+  modalCancel: {
+    flex: 1,
+    padding: "11px",
+    borderRadius: "12px",
+    border: "1px solid #e5e7eb",
+    background: "#f9fafb",
+    color: "#374151",
+    fontSize: "14px",
+    fontWeight: "600",
+    cursor: "pointer",
+  },
+  modalConfirm: {
+    flex: 1,
+    padding: "11px",
+    borderRadius: "12px",
+    border: "none",
+    background: "linear-gradient(135deg, #dc2626 0%, #991b1b 100%)",
+    color: "#ffffff",
+    fontSize: "14px",
+    fontWeight: "700",
+    cursor: "pointer",
+    boxShadow: "0 4px 14px rgba(220,38,38,0.35)",
+  },
 };

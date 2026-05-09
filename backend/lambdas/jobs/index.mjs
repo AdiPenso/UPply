@@ -1,6 +1,6 @@
 // UPply — /jobs Lambda
-// Routes searches to JSearch (US/UK/global) or CareerJet (Israel)
-// and normalizes the response so the frontend only has one data shape.
+// Routes searches to JSearch (US/UK/global) or CareerJet (Israel).
+// Supports pagination: pass ?page=N (1-based, 10 results per page).
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -39,7 +39,7 @@ function detectCountry(location) {
   return null;
 }
 
-async function fetchFromCareerJet(keywords, location, sourceIp, userAgent) {
+async function fetchFromCareerJet(keywords, location, sourceIp, userAgent, page) {
   const affiliateUrl = process.env.CAREERJET_AFFILIATE_URL || "https://www.int.mta.ac.il";
 
   const params = new URLSearchParams({
@@ -47,7 +47,8 @@ async function fetchFromCareerJet(keywords, location, sourceIp, userAgent) {
     keywords: keywords || "software developer",
     location: location || "",
     locale_code: "en_GB",
-    pagesize: "20",
+    pagesize: "10",
+    page: String(page),
     sort: "relevance",
     user_ip: sourceIp || "127.0.0.1",
     user_agent: userAgent || "UPply/1.0",
@@ -70,11 +71,11 @@ async function fetchFromCareerJet(keywords, location, sourceIp, userAgent) {
   try {
     data = JSON.parse(rawText);
   } catch {
-    throw new Error(`CareerJet returned non-JSON response. Likely the affid is not approved yet. First 200 chars: ${rawText.slice(0, 200)}`);
+    throw new Error(`CareerJet returned non-JSON. Likely affid not approved yet. First 200 chars: ${rawText.slice(0, 200)}`);
   }
   if (data.type === "ERROR") throw new Error(`CareerJet: ${data.error}`);
 
-  return (data.jobs || []).map((j) => ({
+  const jobs = (data.jobs || []).map((j) => ({
     title: j.title,
     company: j.company,
     location: j.locations,
@@ -86,11 +87,15 @@ async function fetchFromCareerJet(keywords, location, sourceIp, userAgent) {
     type: null,
     source: "careerjet",
   }));
+
+  // CareerJet returns `hits` = total results found
+  const total = data.hits || 0;
+  return { jobs, total };
 }
 
-async function fetchFromJSearch(keywords, location, country) {
+async function fetchFromJSearch(keywords, location, country, page) {
   const query = [keywords || "software developer", location].filter(Boolean).join(" in ");
-  const params = new URLSearchParams({ query, page: "1", num_pages: "2" });
+  const params = new URLSearchParams({ query, page: String(page), num_pages: "1" });
   if (country) params.set("country", country);
 
   const res = await fetch(`${JSEARCH_URL}?${params}`, {
@@ -102,7 +107,7 @@ async function fetchFromJSearch(keywords, location, country) {
   if (!res.ok) throw new Error(`JSearch HTTP ${res.status}`);
   const data = await res.json();
 
-  return (data.data || []).map((j) => ({
+  const jobs = (data.data || []).map((j) => ({
     title: j.job_title,
     company: j.employer_name,
     location: [j.job_city, j.job_state, j.job_country].filter(Boolean).join(", "),
@@ -119,35 +124,44 @@ async function fetchFromJSearch(keywords, location, country) {
     type: j.job_employment_type || null,
     source: "jsearch",
   }));
+
+  // JSearch returns total_count in the response
+  const total = data.total_count || 0;
+  return { jobs, total };
 }
 
 export const handler = async (event) => {
-  // Handle CORS preflight
   if (event.requestContext?.http?.method === "OPTIONS" || event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: CORS_HEADERS, body: "" };
   }
 
   const qs = event.queryStringParameters || {};
   const keywords = qs.keywords || "";
-  const location = qs.location || "";
-  const country = qs.country || detectCountry(location);
+  const location  = qs.location  || "";
+  const country   = qs.country   || detectCountry(location);
+  const page      = Math.max(1, parseInt(qs.page || "1", 10));
 
-  const sourceIp = event.requestContext?.http?.sourceIp || event.requestContext?.identity?.sourceIp;
+  const sourceIp  = event.requestContext?.http?.sourceIp || event.requestContext?.identity?.sourceIp;
   const userAgent = event.headers?.["user-agent"] || event.headers?.["User-Agent"];
 
   try {
-    // Route to CareerJet for Israel (JSearch has no Israeli data on free tier)
-    // Route to JSearch for everywhere else (better US/UK/global coverage)
     const useCareerJet = country === "il";
 
-    const jobs = useCareerJet
-      ? await fetchFromCareerJet(keywords, location, sourceIp, userAgent)
-      : await fetchFromJSearch(keywords, location, country);
+    const { jobs, total } = useCareerJet
+      ? await fetchFromCareerJet(keywords, location, sourceIp, userAgent, page)
+      : await fetchFromJSearch(keywords, location, country, page);
 
     return {
       statusCode: 200,
       headers: CORS_HEADERS,
-      body: JSON.stringify({ jobs, source: useCareerJet ? "careerjet" : "jsearch", count: jobs.length }),
+      body: JSON.stringify({
+        jobs,
+        source: useCareerJet ? "careerjet" : "jsearch",
+        count: jobs.length,
+        page,
+        total,
+        has_more: jobs.length === 10,   // if we got a full page, assume there's more
+      }),
     };
   } catch (err) {
     console.error("Jobs lambda error:", err);

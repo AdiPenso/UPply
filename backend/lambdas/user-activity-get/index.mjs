@@ -59,12 +59,13 @@ export const handler = async (event) => {
     } while (ExclusiveStartKey);
 
     const toJob = (it) => ({
+      activity_id: it.activity_id,   // needed by the frontend for update/delete
       job_url: it.job_url,
       title: it.job_title || "",
       company: it.company || "",
       location: it.location || "",
       timestamp: it.timestamp || "",
-      status: it.status,
+      status: it.status || (it.action === "apply" ? "applied" : undefined),
     });
 
     // Newest first

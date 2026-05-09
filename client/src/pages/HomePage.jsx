@@ -4,6 +4,32 @@ import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
 import { fetchJobs, getProfile, getActivity, postActivity } from "../services/api";
 
+// ── Job-results cache ─────────────────────────────────────────────────────────
+// We keep the last search result in sessionStorage so navigating to AccountPage
+// and back instantly restores the list without a network round-trip.
+// Cache expires after 5 minutes to avoid showing very stale jobs.
+const JOBS_CACHE_KEY = "upply_jobs_cache";
+const JOBS_CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+function readJobsCache() {
+  try {
+    const raw = sessionStorage.getItem(JOBS_CACHE_KEY);
+    if (!raw) return null;
+    const c = JSON.parse(raw);
+    if (Date.now() - c.ts > JOBS_CACHE_TTL) return null;
+    return c; // { kw, loc, page, jobs, hasMore }
+  } catch { return null; }
+}
+
+function writeJobsCache(kw, loc, pg, jobs, hasMore) {
+  try {
+    sessionStorage.setItem(
+      JOBS_CACHE_KEY,
+      JSON.stringify({ kw, loc, page: pg, jobs, hasMore, ts: Date.now() })
+    );
+  } catch { /* storage quota exceeded — safe to ignore */ }
+}
+
 export default function HomePage() {
   const [jobs, setJobs] = useState([]);
   const [keywords, setKeywords] = useState("");
@@ -15,6 +41,15 @@ export default function HomePage() {
   const [savedJobs, setSavedJobs] = useState(new Set());
   const [userId, setUserId] = useState("");
 
+  // Pagination
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
+  const [searchedKw, setSearchedKw] = useState("software developer");
+  const [searchedLoc, setSearchedLoc] = useState("");
+
+  // Apply confirmation modal
+  const [applyModal, setApplyModal] = useState(null); // job object or null
+
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -22,35 +57,38 @@ export default function HomePage() {
   }, []);
 
   const initPage = async () => {
-    // Load profile name in background — don't block the page from rendering
     try {
       const session = await fetchAuthSession();
       const payload = session?.tokens?.idToken?.payload || {};
-      const userId = payload.sub;
-      if (userId) setUserId(userId);
+      const uid = payload.sub;
+      if (uid) setUserId(uid);
 
       // First-visit detection via localStorage keyed by user id
-      const visitKey = userId ? `upply_visited_${userId}` : null;
+      const visitKey = uid ? `upply_visited_${uid}` : null;
       const hasVisited = visitKey ? localStorage.getItem(visitKey) : null;
       setIsReturning(!!hasVisited);
       if (visitKey) localStorage.setItem(visitKey, "1");
 
-      // Fallback from Cognito token while DynamoDB fetch is in flight
-      let tokenName = payload.given_name || (payload.name ? payload.name.split(" ")[0] : "");
-      if (!tokenName && payload.email) {
-        const raw = payload.email.split("@")[0].split(/[._\d]/)[0];
-        tokenName = raw.charAt(0).toUpperCase() + raw.slice(1);
-      }
-      if (tokenName) setUserName(tokenName);
+      // Name — localStorage is the only fast path; Cognito JWT is never used
+      // because it caches the old name until the next sign-in.
+      if (uid) {
+        const cacheKey = `upply_name_${uid}`;
+        const nameCached = JSON.parse(localStorage.getItem(cacheKey) || "null");
+        // Show the cached name instantly (no flicker) while DynamoDB loads.
+        if (nameCached?.first) setUserName(nameCached.first);
 
-      // DynamoDB is the source of truth — prefer first_name from /profile.
-      // Activity (saved jobs) comes from the dedicated UserActivity table via /activity.
-      if (userId) {
         const [profile, activity] = await Promise.all([
-          getProfile(userId).catch(() => null),
-          getActivity(userId).catch(() => null),
+          getProfile(uid).catch(() => null),
+          getActivity(uid).catch(() => null),
         ]);
-        if (profile?.first_name) setUserName(profile.first_name);
+
+        if (profile?.first_name) {
+          setUserName(profile.first_name);
+          localStorage.setItem(
+            cacheKey,
+            JSON.stringify({ first: profile.first_name, last: profile.last_name || "" })
+          );
+        }
         if (Array.isArray(activity?.saved)) {
           setSavedJobs(new Set(activity.saved.map((j) => j.job_url)));
         }
@@ -59,30 +97,65 @@ export default function HomePage() {
       console.warn("Could not load profile:", err);
     }
 
-    searchJobs("software developer", "");
+    // ── Restore job cache if still warm ──────────────────────────────────────
+    // If the user navigated away and back within 5 minutes, skip the network
+    // call and show the cached results immediately.
+    const jobsCache = readJobsCache();
+    if (jobsCache) {
+      setSearchedKw(jobsCache.kw);
+      setSearchedLoc(jobsCache.loc);
+      setPage(jobsCache.page);
+      setJobs(jobsCache.jobs);
+      setHasMore(jobsCache.hasMore);
+      setIsLoading(false);
+    } else {
+      searchJobs("software developer", "", 1);
+    }
   };
 
-  const searchJobs = async (kw, loc) => {
+  const searchJobs = async (kw, loc, pg = 1) => {
     setIsLoading(true);
     setError("");
     try {
-      const results = await fetchJobs(kw, loc);
+      const { jobs: results, hasMore: more } = await fetchJobs(kw, loc, pg);
       setJobs(results);
+      setHasMore(more);
+      // Keep the cache warm so back-navigation is instant.
+      writeJobsCache(kw, loc, pg, results, more);
     } catch (err) {
       console.error("Job fetch error:", err);
       setError(err.message || "Could not load jobs.");
       setJobs([]);
+      setHasMore(false);
     } finally {
       setIsLoading(false);
     }
   };
 
   const handleSearch = () => {
-    searchJobs(keywords || "software developer", location);
+    const kw = keywords || "software developer";
+    setSearchedKw(kw);
+    setSearchedLoc(location);
+    setPage(1);
+    searchJobs(kw, location, 1);
   };
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter") handleSearch();
+  };
+
+  const handlePrevPage = () => {
+    const p = Math.max(1, page - 1);
+    setPage(p);
+    searchJobs(searchedKw, searchedLoc, p);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const handleNextPage = () => {
+    const p = page + 1;
+    setPage(p);
+    searchJobs(searchedKw, searchedLoc, p);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const trackActivity = async (action, job) => {
@@ -106,9 +179,18 @@ export default function HomePage() {
     trackActivity(isSaved ? "unsave" : "save", job);
   };
 
+  // Open the URL immediately, then ask if they actually submitted
   const handleApply = (job) => {
-    trackActivity("apply", job);
     window.open(job.url, "_blank", "noopener,noreferrer");
+    setApplyModal(job);
+  };
+
+  // Called when user answers Yes/No in the modal
+  const confirmApply = async (didApply) => {
+    if (didApply && applyModal) {
+      await trackActivity("apply", applyModal);
+    }
+    setApplyModal(null);
   };
 
   const handleLogout = async () => {
@@ -174,7 +256,11 @@ export default function HomePage() {
 
         {/* Feed label */}
         <p style={styles.feedLabel}>
-          {isLoading ? "Loading..." : jobs.length > 0 ? `${jobs.length} jobs found` : ""}
+          {isLoading
+            ? "🔍 Searching for the best jobs for you, please wait…"
+            : jobs.length > 0
+            ? `Page ${page}`
+            : ""}
         </p>
 
         {/* Error */}
@@ -182,25 +268,94 @@ export default function HomePage() {
 
         {/* Job feed */}
         <div style={styles.feed}>
+          {/* Skeleton while loading */}
+          {isLoading && [...Array(5)].map((_, i) => <SkeletonCard key={i} />)}
+
+          {/* Empty state */}
           {!isLoading && !error && jobs.length === 0 && (
-            <p style={styles.emptyText}>No jobs found. Try different keywords or location.</p>
+            <p style={styles.emptyText}>
+              No jobs found. Try different keywords or location.
+            </p>
           )}
 
-          {jobs.map((job, idx) => (
-            <JobCard
-              key={idx}
-              job={job}
-              isSaved={savedJobs.has(job.url)}
-              onSave={() => handleSave(job)}
-              onApply={() => handleApply(job)}
-            />
-          ))}
-
+          {/* Job cards */}
+          {!isLoading &&
+            jobs.map((job, idx) => (
+              <JobCard
+                key={idx}
+                job={job}
+                isSaved={savedJobs.has(job.url)}
+                onSave={() => handleSave(job)}
+                onApply={() => handleApply(job)}
+              />
+            ))}
         </div>
+
+        {/* Pagination */}
+        {!isLoading && !error && (page > 1 || hasMore) && (
+          <div style={styles.pagination}>
+            <button
+              style={{
+                ...styles.pageBtn,
+                opacity: page === 1 ? 0.4 : 1,
+                cursor: page === 1 ? "not-allowed" : "pointer",
+              }}
+              onClick={handlePrevPage}
+              disabled={page === 1}
+            >
+              ← Previous
+            </button>
+            <span style={styles.pageNum}>Page {page}</span>
+            <button
+              style={{
+                ...styles.pageBtn,
+                opacity: !hasMore ? 0.4 : 1,
+                cursor: !hasMore ? "not-allowed" : "pointer",
+              }}
+              onClick={handleNextPage}
+              disabled={!hasMore}
+            >
+              Next →
+            </button>
+          </div>
+        )}
       </div>
+
+      {/* Apply confirmation modal — cannot be dismissed without answering */}
+      {applyModal && (
+        <div style={modalStyles.overlay}>
+          <div style={modalStyles.box}>
+            <div style={modalStyles.icon}>📤</div>
+            <h3 style={modalStyles.title}>Did you submit your application?</h3>
+            <p style={modalStyles.sub}>
+              <strong>{applyModal.title}</strong>
+              {applyModal.company ? ` at ${applyModal.company}` : ""}
+            </p>
+            <div style={modalStyles.buttons}>
+              <button
+                style={modalStyles.yesBtn}
+                onClick={() => confirmApply(true)}
+              >
+                ✅ Yes, I applied
+              </button>
+              <button
+                style={modalStyles.noBtn}
+                onClick={() => confirmApply(false)}
+              >
+                ✗ Not yet
+              </button>
+            </div>
+            <p style={modalStyles.note}>
+              Please answer to continue — this keeps your stats accurate.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
+// ── Job Card ──────────────────────────────────────────────────────────────────
 
 function JobCard({ job, isSaved, onSave, onApply }) {
   return (
@@ -209,10 +364,18 @@ function JobCard({ job, isSaved, onSave, onApply }) {
         <h3 style={cardStyles.title}>{job.title}</h3>
         <p style={cardStyles.company}>{job.company}</p>
         <div style={cardStyles.meta}>
-          {job.location && <span style={cardStyles.metaItem}>📍 {job.location}</span>}
-          {job.isRemote && <span style={cardStyles.remoteBadge}>Remote</span>}
-          {job.type && <span style={cardStyles.metaItem}>🕐 {job.type}</span>}
-          {job.salary && <span style={cardStyles.salary}>💰 {job.salary}</span>}
+          {job.location && (
+            <span style={cardStyles.metaItem}>📍 {job.location}</span>
+          )}
+          {job.isRemote && (
+            <span style={cardStyles.remoteBadge}>Remote</span>
+          )}
+          {job.type && (
+            <span style={cardStyles.metaItem}>🕐 {job.type}</span>
+          )}
+          {job.salary && (
+            <span style={cardStyles.salary}>💰 {job.salary}</span>
+          )}
           {job.date && <span style={cardStyles.date}>{job.date}</span>}
         </div>
         {job.description && (
@@ -238,6 +401,31 @@ function JobCard({ job, isSaved, onSave, onApply }) {
   );
 }
 
+// ── Skeleton Card (shown while loading) ──────────────────────────────────────
+
+function SkeletonCard() {
+  return (
+    <div style={cardStyles.card}>
+      <div style={{ flex: 1 }}>
+        <span className="skeleton-shimmer" style={sk.title} />
+        <span className="skeleton-shimmer" style={sk.company} />
+        <div style={sk.metaRow}>
+          <span className="skeleton-shimmer" style={sk.chip} />
+          <span className="skeleton-shimmer" style={sk.chip} />
+        </div>
+        <span className="skeleton-shimmer" style={sk.line} />
+        <span className="skeleton-shimmer" style={{ ...sk.line, width: "65%" }} />
+      </div>
+      <div style={cardStyles.actions}>
+        <span className="skeleton-shimmer" style={sk.btn} />
+        <span className="skeleton-shimmer" style={sk.btn} />
+      </div>
+    </div>
+  );
+}
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+
 const styles = {
   page: {
     minHeight: "100vh",
@@ -256,9 +444,7 @@ const styles = {
     top: 0,
     zIndex: 10,
   },
-  logo: {
-    width: "90px",
-  },
+  logo: { width: "90px" },
   headerRight: {
     display: "flex",
     flexDirection: "column",
@@ -356,9 +542,6 @@ const styles = {
     textDecoration: "underline",
     textUnderlineOffset: "2px",
   },
-  btnIcon: {
-    fontSize: "12px",
-  },
   content: {
     maxWidth: "760px",
     width: "100%",
@@ -406,6 +589,7 @@ const styles = {
     fontSize: "14px",
     color: "#6b7280",
     margin: "8px 0 16px 0",
+    minHeight: "20px",
   },
   errorText: {
     color: "#b91c1c",
@@ -427,6 +611,30 @@ const styles = {
     fontSize: "15px",
     marginTop: "48px",
   },
+  pagination: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "16px",
+    padding: "28px 0 8px",
+  },
+  pageBtn: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    color: "white",
+    border: "none",
+    borderRadius: "10px",
+    padding: "10px 22px",
+    fontSize: "14px",
+    fontWeight: "700",
+    boxShadow: "0 4px 12px rgba(124,58,237,0.3)",
+  },
+  pageNum: {
+    fontSize: "14px",
+    color: "#6b7280",
+    fontWeight: "600",
+    minWidth: "64px",
+    textAlign: "center",
+  },
 };
 
 const cardStyles = {
@@ -440,10 +648,7 @@ const cardStyles = {
     alignItems: "flex-start",
     gap: "16px",
   },
-  body: {
-    flex: 1,
-    minWidth: 0,
-  },
+  body: { flex: 1, minWidth: 0 },
   title: {
     margin: "0 0 4px 0",
     fontSize: "17px",
@@ -462,10 +667,7 @@ const cardStyles = {
     gap: "12px",
     marginBottom: "8px",
   },
-  metaItem: {
-    fontSize: "13px",
-    color: "#6b7280",
-  },
+  metaItem: { fontSize: "13px", color: "#6b7280" },
   remoteBadge: {
     fontSize: "12px",
     fontWeight: "600",
@@ -474,15 +676,8 @@ const cardStyles = {
     borderRadius: "6px",
     padding: "2px 8px",
   },
-  salary: {
-    fontSize: "13px",
-    color: "#065f46",
-    fontWeight: "500",
-  },
-  date: {
-    fontSize: "13px",
-    color: "#9ca3af",
-  },
+  salary: { fontSize: "13px", color: "#065f46", fontWeight: "500" },
+  date: { fontSize: "13px", color: "#9ca3af" },
   description: {
     margin: 0,
     fontSize: "13px",
@@ -528,5 +723,83 @@ const cardStyles = {
     cursor: "pointer",
     whiteSpace: "nowrap",
     boxShadow: "0 4px 12px rgba(124,58,237,0.3)",
+  },
+};
+
+// Skeleton placeholder dimensions
+const sk = {
+  title:   { height: "18px", width: "55%", marginBottom: "10px" },
+  company: { height: "14px", width: "35%", marginBottom: "12px" },
+  metaRow: { display: "flex", gap: "10px", marginBottom: "12px" },
+  chip:    { height: "12px", width: "80px" },
+  line:    { height: "12px", width: "90%", marginBottom: "6px" },
+  btn:     { height: "36px", width: "80px", borderRadius: "10px" },
+};
+
+// Apply confirmation modal styles
+const modalStyles = {
+  overlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(0,0,0,0.55)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 1000,
+    backdropFilter: "blur(4px)",
+  },
+  box: {
+    background: "#ffffff",
+    borderRadius: "20px",
+    padding: "36px 32px",
+    maxWidth: "400px",
+    width: "90%",
+    textAlign: "center",
+    boxShadow: "0 20px 60px rgba(0,0,0,0.2)",
+  },
+  icon:  { fontSize: "40px", marginBottom: "12px" },
+  title: {
+    fontSize: "20px",
+    fontWeight: "800",
+    color: "#111827",
+    margin: "0 0 8px 0",
+  },
+  sub: {
+    fontSize: "14px",
+    color: "#6b7280",
+    margin: "0 0 24px 0",
+    lineHeight: 1.5,
+  },
+  buttons: {
+    display: "flex",
+    gap: "12px",
+    justifyContent: "center",
+    marginBottom: "14px",
+  },
+  yesBtn: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    color: "white",
+    border: "none",
+    borderRadius: "12px",
+    padding: "12px 24px",
+    fontSize: "15px",
+    fontWeight: "700",
+    cursor: "pointer",
+    boxShadow: "0 4px 12px rgba(124,58,237,0.3)",
+  },
+  noBtn: {
+    background: "#f3f4f6",
+    color: "#374151",
+    border: "1px solid #e5e7eb",
+    borderRadius: "12px",
+    padding: "12px 24px",
+    fontSize: "15px",
+    fontWeight: "600",
+    cursor: "pointer",
+  },
+  note: {
+    fontSize: "11px",
+    color: "#9ca3af",
+    margin: 0,
   },
 };

@@ -41,11 +41,12 @@ export const updateProfile = async (userId, fields) => {
 // ── Jobs ──────────────────────────────────────────────────────────────────────
 
 // Search jobs. Lambda routes to CareerJet (Israel) or JSearch (everywhere else).
-// Returns a normalized array of job objects.
-export const fetchJobs = async (keywords, location) => {
+// Returns { jobs: [...], hasMore: bool } — fetches one page of 10 at a time.
+export const fetchJobs = async (keywords, location, page = 1) => {
   const params = new URLSearchParams();
   if (keywords) params.set("keywords", keywords);
-  if (location) params.set("location", location);
+  if (location)  params.set("location", location);
+  params.set("page", String(page));
 
   const res = await fetch(`${API_BASE_URL}/jobs?${params}`);
   if (!res.ok) {
@@ -54,7 +55,10 @@ export const fetchJobs = async (keywords, location) => {
     throw new Error(`Jobs API error ${res.status}`);
   }
   const data = await res.json();
-  return data.jobs || [];
+  return {
+    jobs: data.jobs || [],
+    hasMore: data.has_more ?? (data.jobs?.length === 10),
+  };
 };
 
 // ── Activity ──────────────────────────────────────────────────────────────────
@@ -83,5 +87,28 @@ export const postActivity = async (userId, action, job) => {
     }),
   });
   if (!res.ok) throw new Error(`postActivity failed: ${res.status}`);
+  return res.json();
+};
+
+// Update the status of an existing apply row (interview / offer / accepted / rejected).
+// activityId is the DynamoDB sort key returned by getActivity (e.g. "apply#...").
+export const updateActivityStatus = async (userId, activityId, status) => {
+  const res = await fetch(`${API_BASE_URL}/activity`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, action: "update_status", activity_id: activityId, status }),
+  });
+  if (!res.ok) throw new Error(`updateActivityStatus failed: ${res.status}`);
+  return res.json();
+};
+
+// Hard-delete an activity row (works for both saved and applied items).
+export const deleteActivity = async (userId, activityId) => {
+  const res = await fetch(`${API_BASE_URL}/activity`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, action: "delete", activity_id: activityId }),
+  });
+  if (!res.ok) throw new Error(`deleteActivity failed: ${res.status}`);
   return res.json();
 };
