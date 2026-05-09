@@ -2,27 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
-import { API_BASE_URL } from "../aws/config";
-
-// Calls our AWS Lambda via API Gateway.
-// The Lambda decides whether to query JSearch (global) or CareerJet (Israel)
-// and returns a normalized job list.
-async function fetchJobs(keywords, location) {
-  const params = new URLSearchParams();
-  if (keywords) params.set("keywords", keywords);
-  if (location) params.set("location", location);
-
-  const res = await fetch(`${API_BASE_URL}/jobs?${params}`);
-
-  if (!res.ok) {
-    const text = await res.text();
-    console.error("Jobs API error:", res.status, text);
-    throw new Error(`Jobs API error ${res.status}`);
-  }
-  const data = await res.json();
-  console.log("Jobs response:", data);
-  return data.jobs || [];
-}
+import { fetchJobs, getProfile, getActivity, postActivity } from "../services/api";
 
 export default function HomePage() {
   const [jobs, setJobs] = useState([]);
@@ -66,19 +46,13 @@ export default function HomePage() {
       // DynamoDB is the source of truth — prefer first_name from /profile.
       // Activity (saved jobs) comes from the dedicated UserActivity table via /activity.
       if (userId) {
-        const [profileRes, activityRes] = await Promise.all([
-          fetch(`${API_BASE_URL}/profile?user_id=${userId}`),
-          fetch(`${API_BASE_URL}/activity?user_id=${userId}`),
+        const [profile, activity] = await Promise.all([
+          getProfile(userId).catch(() => null),
+          getActivity(userId).catch(() => null),
         ]);
-        if (profileRes.ok) {
-          const profile = await profileRes.json();
-          if (profile.first_name) setUserName(profile.first_name);
-        }
-        if (activityRes.ok) {
-          const activity = await activityRes.json();
-          if (Array.isArray(activity.saved)) {
-            setSavedJobs(new Set(activity.saved.map((j) => j.job_url)));
-          }
+        if (profile?.first_name) setUserName(profile.first_name);
+        if (Array.isArray(activity?.saved)) {
+          setSavedJobs(new Set(activity.saved.map((j) => j.job_url)));
         }
       }
     } catch (err) {
@@ -114,20 +88,7 @@ export default function HomePage() {
   const trackActivity = async (action, job) => {
     if (!userId) return;
     try {
-      await fetch(`${API_BASE_URL}/activity`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          user_id: userId,
-          action,
-          job: {
-            job_url: job.url,
-            title: job.title,
-            company: job.company,
-            location: job.location,
-          },
-        }),
-      });
+      await postActivity(userId, action, job);
     } catch (err) {
       console.warn("Activity tracking failed:", err);
     }

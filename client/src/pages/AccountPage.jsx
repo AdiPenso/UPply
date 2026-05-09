@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
-import { API_BASE_URL } from "../aws/config";
+import { getProfile, getActivity, updateProfile } from "../services/api";
 
 // Fields we count toward "Profile strength"
 const STRENGTH_FIELDS = [
@@ -83,21 +83,19 @@ export default function AccountPage() {
       }
 
       // Profile (Users table) and activity (UserActivity table) are independent — fetch in parallel
-      const [res, actRes] = await Promise.all([
-        fetch(`${API_BASE_URL}/profile?user_id=${sub}`),
-        fetch(`${API_BASE_URL}/activity?user_id=${sub}`),
+      const [raw, act] = await Promise.all([
+        getProfile(sub).catch(() => null),
+        getActivity(sub).catch(() => null),
       ]);
 
-      if (actRes.ok) {
-        const act = await actRes.json();
+      if (act) {
         setActivity({
           saved: Array.isArray(act.saved) ? act.saved : [],
           applied: Array.isArray(act.applied) ? act.applied : [],
         });
       }
 
-      if (res.ok) {
-        const raw = await res.json();
+      if (raw) {
         // Handle different response shapes from profile-get Lambda:
         //   - flat object: { first_name: "Lir", ... }
         //   - DynamoDB GetItem: { Item: { first_name: "Lir", ... } }
@@ -158,16 +156,7 @@ export default function AccountPage() {
 
     setSaveNotice("Saving…");
     try {
-      const res = await fetch(`${API_BASE_URL}/profile`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId, ...cleaned }),
-      });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`HTTP ${res.status}: ${txt.slice(0, 120)}`);
-      }
-      const data = await res.json();
+      const data = await updateProfile(userId, cleaned);
       if (data.profile) setProfile(data.profile);
       setSaveNotice("✅ Saved!");
       setTimeout(() => setSaveNotice(""), 2500);

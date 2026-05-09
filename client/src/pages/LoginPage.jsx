@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import Header from "../components/Header.jsx";
 import { signIn, signOut, fetchAuthSession } from "aws-amplify/auth";
-import { API_BASE_URL } from "../aws/config";
+import { getProfile } from "../services/api";
 
 function LoginPage() {
   const [email, setEmail] = useState("");
@@ -32,15 +32,7 @@ function LoginPage() {
         throw new Error("Could not get user id from session.");
       }
 
-    const response = await fetch(
-  `${API_BASE_URL}/profile?user_id=${userId}`
-);
-
-      if (!response.ok) {
-        throw new Error(`getUserProfile failed with status ${response.status}`);
-      }
-
-      const data = await response.json();
+      const data = await getProfile(userId);
 
       if (data.exists) {
         navigate("/home");

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession } from "aws-amplify/auth";
 import Header from "../components/Header.jsx";
-import { API_BASE_URL } from "../aws/config";
+import { createProfile } from "../services/api";
 
 function CompleteProfilePage() {
   const [firstName, setFirstName] = useState("");
@@ -24,24 +24,14 @@ function CompleteProfilePage() {
       const userId = session.tokens.idToken.payload.sub;
       const email = session.tokens.idToken.payload.email;
 
-      const response = await fetch(`${API_BASE_URL}/profile`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          user_id: userId,
-          email: email,
-          phone: phone,
-          first_name: firstName,
-          last_name: lastName,
-          location: location,
-        }),
+      await createProfile({
+        user_id: userId,
+        email,
+        first_name: firstName,
+        last_name: lastName,
+        phone,
+        location,
       });
-
-      if (!response.ok) {
-        throw new Error("Failed to save profile");
-      }
 
       navigate("/home");
     } catch (error) {
@@ -83,6 +73,14 @@ function CompleteProfilePage() {
           placeholder="Phone"
           value={phone}
           onChange={(e) => setPhone(e.target.value)}
+        />
+
+        <input
+          style={styles.input}
+          type="text"
+          placeholder="Location (e.g. Tel Aviv, Israel)"
+          value={location}
+          onChange={(e) => setLocation(e.target.value)}
         />
 
         <button
