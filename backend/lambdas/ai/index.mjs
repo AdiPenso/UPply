@@ -97,14 +97,11 @@ async function callOpenAI(model, messages, maxTokens, temperature = 0.7) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY environment variable is not set");
 
-  // search-preview models don't accept temperature or max_tokens — they use
-  // max_output_tokens instead and have no temperature control.
+  // search-preview models use Chat Completions but reject `temperature`.
+  // max_tokens still works; just omit temperature for these models.
   const isSearchModel = model.includes("search-preview");
-  const payload = { model, messages };
-  if (isSearchModel) {
-    payload.max_output_tokens = maxTokens;
-  } else {
-    payload.max_tokens  = maxTokens;
+  const payload = { model, messages, max_tokens: maxTokens };
+  if (!isSearchModel) {
     payload.temperature = temperature;
   }
 
