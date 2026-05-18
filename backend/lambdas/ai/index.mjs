@@ -20,9 +20,10 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 
-const OPENAI_URL  = "https://api.openai.com/v1/chat/completions";
-const CHAT_MODEL  = "gpt-4o-mini-search-preview";   // has built-in web search
-const ANLZ_MODEL  = "gpt-4.1-mini";
+const OPENAI_CHAT_URL      = "https://api.openai.com/v1/chat/completions";
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const CHAT_MODEL  = "gpt-4o-mini-search-preview";   // Responses API + built-in web search
+const ANLZ_MODEL  = "gpt-4.1-mini";                 // Chat Completions API
 
 const USERS_TABLE      = process.env.USERS_TABLE      || "Users";
 const ACTIVITY_TABLE   = process.env.ACTIVITY_TABLE   || "UserActivity";
@@ -91,21 +92,50 @@ async function fetchActivityCounts(userId) {
   }
 }
 
-// ── OpenAI helper ─────────────────────────────────────────────────────────────
+// ── OpenAI helpers ────────────────────────────────────────────────────────────
 
+// Standard Chat Completions API — used for analyze_job and extract_cv
 async function callOpenAI(model, messages, maxTokens, temperature = 0.7) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY environment variable is not set");
 
-  // search-preview models use Chat Completions but reject `temperature`.
-  // max_tokens still works; just omit temperature for these models.
-  const isSearchModel = model.includes("search-preview");
-  const payload = { model, messages, max_tokens: maxTokens };
-  if (!isSearchModel) {
-    payload.temperature = temperature;
+  const res = await fetch(OPENAI_CHAT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${key}`,
+    },
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature }),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`OpenAI ${res.status}: ${txt.slice(0, 300)}`);
   }
 
-  const res = await fetch(OPENAI_URL, {
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content?.trim() || "";
+}
+
+// Responses API — used for gpt-4o-mini-search-preview (has built-in web search)
+// Different endpoint and response shape from Chat Completions.
+async function callOpenAIWithSearch(messages, maxTokens) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error("OPENAI_API_KEY environment variable is not set");
+
+  // Separate system message → instructions field (Responses API best practice)
+  const systemMsg = messages.find(m => m.role === "system");
+  const inputMessages = messages.filter(m => m.role !== "system");
+
+  const payload = {
+    model: CHAT_MODEL,
+    tools: [{ type: "web_search_preview" }],
+    max_output_tokens: maxTokens,
+    input: inputMessages,
+  };
+  if (systemMsg) payload.instructions = systemMsg.content;
+
+  const res = await fetch(OPENAI_RESPONSES_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -116,11 +146,15 @@ async function callOpenAI(model, messages, maxTokens, temperature = 0.7) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`OpenAI ${res.status}: ${txt.slice(0, 300)}`);
+    throw new Error(`OpenAI Responses API ${res.status}: ${txt.slice(0, 300)}`);
   }
 
   const data = await res.json();
-  return data.choices?.[0]?.message?.content?.trim() || "";
+  // Response shape: data.output[] → find the message item → find the text content block
+  const textBlock = data.output
+    ?.find(o => o.type === "message")
+    ?.content?.find(c => c.type === "output_text");
+  return textBlock?.text?.trim() || "";
 }
 
 // ── Profile → readable context string ────────────────────────────────────────
@@ -183,7 +217,7 @@ Your role:
     { role: "user",      content: message },
   ];
 
-  const reply = await callOpenAI(CHAT_MODEL, messages, 600, 0.7);
+  const reply = await callOpenAIWithSearch(messages, 600);
   log("info", "Chat reply generated", { user_id: userId, reply_length: reply.length });
   return { reply };
 }
