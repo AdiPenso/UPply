@@ -10,19 +10,23 @@
 //   USERS_TABLE     — DynamoDB users table name (default: "Users")
 //   ACTIVITY_TABLE  — DynamoDB activity table name (default: "UserActivity")
 //
-// Models used (cheap, fast — preserves credit quota):
-//   Chat:    gpt-4.1-nano
-//   Analyze: gpt-4.1-mini  (needs stronger reasoning for structured JSON)
+// Models used:
+//   Chat:    gpt-4o-mini-search-preview  (built-in web search, no temperature param)
+//   Analyze: gpt-4.1-mini               (needs stronger reasoning for structured JSON)
+//
+// Required env vars (add to Lambda console):
+//   DOCUMENTS_TABLE — UserDocuments table name (default: "UserDocuments")
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 
 const OPENAI_URL  = "https://api.openai.com/v1/chat/completions";
-const CHAT_MODEL  = "gpt-4.1-nano";
+const CHAT_MODEL  = "gpt-4o-mini-search-preview";   // has built-in web search
 const ANLZ_MODEL  = "gpt-4.1-mini";
 
-const USERS_TABLE    = process.env.USERS_TABLE    || "Users";
-const ACTIVITY_TABLE = process.env.ACTIVITY_TABLE || "UserActivity";
+const USERS_TABLE      = process.env.USERS_TABLE      || "Users";
+const ACTIVITY_TABLE   = process.env.ACTIVITY_TABLE   || "UserActivity";
+const DOCUMENTS_TABLE  = process.env.DOCUMENTS_TABLE  || "UserDocuments";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
@@ -55,6 +59,23 @@ async function fetchProfile(userId) {
   }
 }
 
+async function fetchPrimaryCV(userId) {
+  try {
+    const res = await ddb.send(new QueryCommand({
+      TableName: DOCUMENTS_TABLE,
+      KeyConditionExpression: "user_id = :u",
+      FilterExpression: "is_primary = :t",
+      ExpressionAttributeValues: { ":u": userId, ":t": true },
+      Limit: 1,
+    }));
+    const item = res.Items?.[0];
+    return item?.cv_text || null;
+  } catch (e) {
+    console.warn("fetchPrimaryCV error:", e.message);
+    return null;
+  }
+}
+
 async function fetchActivityCounts(userId) {
   try {
     const res = await ddb.send(new QueryCommand({
@@ -76,13 +97,24 @@ async function callOpenAI(model, messages, maxTokens, temperature = 0.7) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY environment variable is not set");
 
+  // search-preview models don't accept temperature or max_tokens — they use
+  // max_output_tokens instead and have no temperature control.
+  const isSearchModel = model.includes("search-preview");
+  const payload = { model, messages };
+  if (isSearchModel) {
+    payload.max_output_tokens = maxTokens;
+  } else {
+    payload.max_tokens  = maxTokens;
+    payload.temperature = temperature;
+  }
+
   const res = await fetch(OPENAI_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${key}`,
     },
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature }),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
@@ -121,22 +153,29 @@ Candidate Profile:
 
 async function handleChat(userId, message, history) {
   log("info", "Chat request", { user_id: userId, history_length: history.length, message_length: message.length });
-  const [profile, actCounts] = await Promise.all([
+  const [profile, actCounts, cvText] = await Promise.all([
     fetchProfile(userId),
     fetchActivityCounts(userId),
+    fetchPrimaryCV(userId),
   ]);
 
+  const cvSection = cvText
+    ? `\nUser's Primary CV (full text):\n---\n${cvText.slice(0, 6000)}\n---`
+    : "\n(No CV uploaded yet — advise based on profile fields only.)";
+
   const systemPrompt = `You are a personal AI career coach for ${profile.first_name || "the user"} on UPply, a job-search platform.
+You have access to real-time web search — use it when the user asks about current salary ranges, job market trends, company info, or anything that benefits from up-to-date data.
 
 ${profileContext(profile, actCounts)}
+${cvSection}
 
 Your role:
 - Give honest, specific, actionable career advice.
 - Help with resume improvement, interview prep, job strategy, skill gaps.
+- When relevant, search the web for current data (salary benchmarks, industry trends, company reviews).
 - Keep replies concise (3–5 short paragraphs max). Use bullet points when helpful.
 - Be warm, encouraging, and professional.
-- If the user asks to search for jobs, tell them to use the search bar at the top and suggest good keywords for their situation.
-- Never make up job listings or pretend to browse the internet.`;
+- If the user asks to search for jobs, tell them to use the search bar at the top and suggest good keywords for their situation.`;
 
   // Keep last 10 messages as context (5 exchanges) to limit token usage
   const trimmedHistory = history.slice(-10);
