@@ -8,7 +8,7 @@ import {
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 
-const TABLE_NAME = process.env.USERS_TABLE || "upply-users";
+const TABLE_NAME = process.env.USERS_TABLE || "Users";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
