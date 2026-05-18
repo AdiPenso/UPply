@@ -11,19 +11,18 @@
 //   ACTIVITY_TABLE  — DynamoDB activity table name (default: "UserActivity")
 //
 // Models used:
-//   Chat:    gpt-4o-mini-search-preview  (built-in web search, no temperature param)
-//   Analyze: gpt-4.1-mini               (needs stronger reasoning for structured JSON)
+//   Chat:    gpt-4.1-mini  (fast, smart, cheap)
+//   Analyze: gpt-4.1-mini  (structured JSON analysis)
 //
-// Required env vars (add to Lambda console):
+// Optional env vars:
 //   DOCUMENTS_TABLE — UserDocuments table name (default: "UserDocuments")
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 
-const OPENAI_CHAT_URL      = "https://api.openai.com/v1/chat/completions";
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const CHAT_MODEL  = "gpt-4o-mini-search-preview";   // Responses API + built-in web search
-const ANLZ_MODEL  = "gpt-4.1-mini";                 // Chat Completions API
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const CHAT_MODEL  = "gpt-4.1-mini";   // Chat + analyze
+const ANLZ_MODEL  = "gpt-4.1-mini";   // Structured JSON analysis
 
 const USERS_TABLE      = process.env.USERS_TABLE      || "Users";
 const ACTIVITY_TABLE   = process.env.ACTIVITY_TABLE   || "UserActivity";
@@ -117,64 +116,6 @@ async function callOpenAI(model, messages, maxTokens, temperature = 0.7) {
   return data.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// Responses API — used for gpt-4o-mini-search-preview (has built-in web search)
-// Falls back to gpt-4.1-mini via Chat Completions if the search model fails.
-async function callOpenAIWithSearch(messages, maxTokens) {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error("OPENAI_API_KEY environment variable is not set");
-
-  // ── Try Responses API with web search first ──────────────────────────────
-  try {
-    const systemMsg = messages.find(m => m.role === "system");
-    const inputMessages = messages.filter(m => m.role !== "system");
-
-    const payload = {
-      model: CHAT_MODEL,
-      tools: [{ type: "web_search_preview" }],
-      max_output_tokens: maxTokens,
-      input: inputMessages,
-    };
-    if (systemMsg) payload.instructions = systemMsg.content;
-
-    const res = await fetch(OPENAI_RESPONSES_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text();
-      // Log the full error so we can see it in CloudWatch, then fall back
-      log("warn", "Search model failed — falling back to gpt-4.1-mini", {
-        status: res.status,
-        body: txt.slice(0, 500),
-      });
-      throw new Error(`search_model_unavailable`);
-    }
-
-    const data = await res.json();
-    const textBlock = data.output
-      ?.find(o => o.type === "message")
-      ?.content?.find(c => c.type === "output_text");
-    const text = textBlock?.text?.trim() || "";
-    if (!text) throw new Error("search_model_empty_response");
-
-    log("info", "Chat answered via search model (web search enabled)");
-    return text;
-
-  } catch (err) {
-    if (err.message !== "search_model_unavailable" && err.message !== "search_model_empty_response") {
-      log("warn", "Search model threw unexpectedly — falling back", { error: err.message });
-    }
-  }
-
-  // ── Fallback: Chat Completions with gpt-4.1-mini ─────────────────────────
-  log("info", "Using fallback model gpt-4.1-mini (no web search)");
-  return callOpenAI("gpt-4.1-mini", messages, maxTokens, 0.7);
-}
 
 // ── Profile → readable context string ────────────────────────────────────────
 
@@ -236,7 +177,7 @@ Your role:
     { role: "user",      content: message },
   ];
 
-  const reply = await callOpenAIWithSearch(messages, 600);
+  const reply = await callOpenAI(CHAT_MODEL, messages, 600, 0.7);
   log("info", "Chat reply generated", { user_id: userId, reply_length: reply.length });
   return { reply };
 }
