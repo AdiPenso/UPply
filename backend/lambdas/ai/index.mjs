@@ -118,43 +118,62 @@ async function callOpenAI(model, messages, maxTokens, temperature = 0.7) {
 }
 
 // Responses API — used for gpt-4o-mini-search-preview (has built-in web search)
-// Different endpoint and response shape from Chat Completions.
+// Falls back to gpt-4.1-mini via Chat Completions if the search model fails.
 async function callOpenAIWithSearch(messages, maxTokens) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY environment variable is not set");
 
-  // Separate system message → instructions field (Responses API best practice)
-  const systemMsg = messages.find(m => m.role === "system");
-  const inputMessages = messages.filter(m => m.role !== "system");
+  // ── Try Responses API with web search first ──────────────────────────────
+  try {
+    const systemMsg = messages.find(m => m.role === "system");
+    const inputMessages = messages.filter(m => m.role !== "system");
 
-  const payload = {
-    model: CHAT_MODEL,
-    tools: [{ type: "web_search_preview" }],
-    max_output_tokens: maxTokens,
-    input: inputMessages,
-  };
-  if (systemMsg) payload.instructions = systemMsg.content;
+    const payload = {
+      model: CHAT_MODEL,
+      tools: [{ type: "web_search_preview" }],
+      max_output_tokens: maxTokens,
+      input: inputMessages,
+    };
+    if (systemMsg) payload.instructions = systemMsg.content;
 
-  const res = await fetch(OPENAI_RESPONSES_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${key}`,
-    },
-    body: JSON.stringify(payload),
-  });
+    const res = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`,
+      },
+      body: JSON.stringify(payload),
+    });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`OpenAI Responses API ${res.status}: ${txt.slice(0, 300)}`);
+    if (!res.ok) {
+      const txt = await res.text();
+      // Log the full error so we can see it in CloudWatch, then fall back
+      log("warn", "Search model failed — falling back to gpt-4.1-mini", {
+        status: res.status,
+        body: txt.slice(0, 500),
+      });
+      throw new Error(`search_model_unavailable`);
+    }
+
+    const data = await res.json();
+    const textBlock = data.output
+      ?.find(o => o.type === "message")
+      ?.content?.find(c => c.type === "output_text");
+    const text = textBlock?.text?.trim() || "";
+    if (!text) throw new Error("search_model_empty_response");
+
+    log("info", "Chat answered via search model (web search enabled)");
+    return text;
+
+  } catch (err) {
+    if (err.message !== "search_model_unavailable" && err.message !== "search_model_empty_response") {
+      log("warn", "Search model threw unexpectedly — falling back", { error: err.message });
+    }
   }
 
-  const data = await res.json();
-  // Response shape: data.output[] → find the message item → find the text content block
-  const textBlock = data.output
-    ?.find(o => o.type === "message")
-    ?.content?.find(c => c.type === "output_text");
-  return textBlock?.text?.trim() || "";
+  // ── Fallback: Chat Completions with gpt-4.1-mini ─────────────────────────
+  log("info", "Using fallback model gpt-4.1-mini (no web search)");
+  return callOpenAI("gpt-4.1-mini", messages, maxTokens, 0.7);
 }
 
 // ── Profile → readable context string ────────────────────────────────────────
