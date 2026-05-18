@@ -19,16 +19,11 @@ const CORS_HEADERS = {
   "Content-Type": "application/json",
 };
 
-const ok = (body) => ({
-  statusCode: 200,
-  headers: CORS_HEADERS,
-  body: JSON.stringify(body),
-});
-const bad = (msg, code = 400) => ({
-  statusCode: code,
-  headers: CORS_HEADERS,
-  body: JSON.stringify({ error: msg }),
-});
+const ok  = (body)          => ({ statusCode: 200, headers: CORS_HEADERS, body: JSON.stringify(body) });
+const bad = (msg, code=400) => ({ statusCode: code, headers: CORS_HEADERS, body: JSON.stringify({ error: msg }) });
+
+const log = (level, msg, extra = {}) =>
+  console.log(JSON.stringify({ level, msg, ...extra, ts: new Date().toISOString() }));
 
 export const handler = async (event) => {
   const method =
@@ -40,6 +35,8 @@ export const handler = async (event) => {
     event.queryStringParameters?.user_id ||
     event.queryStringParameters?.userId;
   if (!user_id) return bad("Missing user_id");
+
+  log("info", "Activity GET request", { user_id });
 
   try {
     // Query all rows for this user (paginate in case the user has many).
@@ -81,6 +78,7 @@ export const handler = async (event) => {
       .map(toJob)
       .sort(byTimeDesc);
 
+    log("info", "Activity fetched", { user_id, saved_count: saved.length, applied_count: applied.length });
     return ok({
       saved,
       applied,
@@ -88,7 +86,7 @@ export const handler = async (event) => {
       applied_count: applied.length,
     });
   } catch (err) {
-    console.error("activity-get error:", err);
+    log("error", "activity-get failed", { user_id, error: err.message });
     return bad(err.message || "Read failed", 500);
   }
 };

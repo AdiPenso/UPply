@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Lambda build artifacts — zip files are uploaded to AWS, not stored in git
+backend/lambdas/*.zip
+
+# Lambda node_modules — installed locally before zipping, not needed in git
+backend/lambdas/*/node_modules/
+backend/lambdas/*/package-lock.json
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Build output
+client/dist/
+
+# Editor & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude settings (local only)
+.claude/settings.local.json

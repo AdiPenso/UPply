@@ -4,10 +4,7 @@
 // the complete-profile page or straight to /home).
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import {
-  DynamoDBDocumentClient,
-  GetCommand,
-} from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
 
 const TABLE_NAME = process.env.USERS_TABLE || "Users";
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -19,52 +16,39 @@ const CORS_HEADERS = {
   "Content-Type": "application/json",
 };
 
-export const handler = async (event) => {
-  const method =
-    event.requestContext?.http?.method || event.httpMethod || "GET";
+const ok  = (body)          => ({ statusCode: 200, headers: CORS_HEADERS, body: JSON.stringify(body) });
+const bad = (msg, code=400) => ({ statusCode: code, headers: CORS_HEADERS, body: JSON.stringify({ error: msg }) });
 
-  if (method === "OPTIONS") {
-    return { statusCode: 204, headers: CORS_HEADERS, body: "" };
-  }
+const log = (level, msg, extra = {}) =>
+  console.log(JSON.stringify({ level, msg, ...extra, ts: new Date().toISOString() }));
+
+export const handler = async (event) => {
+  const method = event.requestContext?.http?.method || event.httpMethod || "GET";
+  if (method === "OPTIONS") return { statusCode: 204, headers: CORS_HEADERS, body: "" };
 
   const userId = event.queryStringParameters?.user_id;
   if (!userId) {
-    return {
-      statusCode: 400,
-      headers: CORS_HEADERS,
-      body: JSON.stringify({ error: "Missing user_id" }),
-    };
+    log("warn", "Missing user_id in request");
+    return bad("Missing user_id");
   }
 
+  log("info", "Profile GET request", { user_id: userId });
+
   try {
-    const res = await ddb.send(
-      new GetCommand({
-        TableName: TABLE_NAME,
-        Key: { user_id: userId },
-      })
-    );
+    const res = await ddb.send(new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { user_id: userId },
+    }));
 
     if (!res.Item) {
-      // Profile doesn't exist yet — registration flow uses this.
-      return {
-        statusCode: 200,
-        headers: CORS_HEADERS,
-        body: JSON.stringify({ exists: false }),
-      };
+      log("info", "Profile not found — new user", { user_id: userId });
+      return ok({ exists: false });
     }
 
-    // Return the full profile flat, plus exists:true for the register flow.
-    return {
-      statusCode: 200,
-      headers: CORS_HEADERS,
-      body: JSON.stringify({ exists: true, ...res.Item }),
-    };
+    log("info", "Profile found", { user_id: userId, has_skills: Array.isArray(res.Item.skills) });
+    return ok({ exists: true, ...res.Item });
   } catch (err) {
-    console.error("profile-get error:", err);
-    return {
-      statusCode: 500,
-      headers: CORS_HEADERS,
-      body: JSON.stringify({ error: err.message || "Get failed" }),
-    };
+    log("error", "profile-get failed", { user_id: userId, error: err.message });
+    return bad(err.message || "Get failed", 500);
   }
 };

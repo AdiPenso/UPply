@@ -26,6 +26,9 @@ const CORS_HEADERS = {
 const ok  = (body)          => ({ statusCode: 200, headers: CORS_HEADERS, body: JSON.stringify(body) });
 const bad = (msg, code=400) => ({ statusCode: code, headers: CORS_HEADERS, body: JSON.stringify({ error: msg }) });
 
+const log = (level, msg, extra = {}) =>
+  console.log(JSON.stringify({ level, msg, ...extra, ts: new Date().toISOString() }));
+
 // URL-safe base64 (deterministic, short-ish, no "/" or "+" that could collide
 // with our "#" separator in the sort key).
 const encodeUrl = (url) =>
@@ -51,6 +54,8 @@ export const handler = async (event) => {
 
   const { user_id, action, job, activity_id, status } = body;
   if (!user_id) return bad("Missing user_id");
+
+  log("info", "Activity track request", { user_id, action, job_title: job?.title, activity_id, status });
 
   const VALID_ACTIONS = ["save", "unsave", "apply", "update_status", "delete"];
   if (!VALID_ACTIONS.includes(action)) return bad("Invalid action");
@@ -82,6 +87,7 @@ export const handler = async (event) => {
           timestamp,
         },
       }));
+      log("info", "Job saved", { user_id, job_title: job.title, company: job.company });
       return ok({ ok: true, action: "save" });
     }
 
@@ -92,6 +98,7 @@ export const handler = async (event) => {
         TableName: TABLE_NAME,
         Key: { user_id, activity_id: `save#${urlKey}` },
       }));
+      log("info", "Job unsaved", { user_id, job_title: job.title });
       return ok({ ok: true, action: "unsave" });
     }
 
@@ -112,6 +119,7 @@ export const handler = async (event) => {
           status: "applied",
         },
       }));
+      log("info", "Job application tracked", { user_id, job_title: job.title, company: job.company });
       return ok({ ok: true, action: "apply" });
     }
 
@@ -127,6 +135,7 @@ export const handler = async (event) => {
         ExpressionAttributeNames:  { "#st": "status" },
         ExpressionAttributeValues: { ":s": status },
       }));
+      log("info", "Application status updated", { user_id, activity_id, status });
       return ok({ ok: true, action: "update_status", status });
     }
 
@@ -136,11 +145,12 @@ export const handler = async (event) => {
         TableName: TABLE_NAME,
         Key: { user_id, activity_id },
       }));
+      log("info", "Activity deleted", { user_id, activity_id });
       return ok({ ok: true, action: "delete" });
     }
 
   } catch (err) {
-    console.error("activity-track error:", err);
+    log("error", "activity-track failed", { user_id, action, error: err.message });
     return bad(err.message || "Write failed", 500);
   }
 };

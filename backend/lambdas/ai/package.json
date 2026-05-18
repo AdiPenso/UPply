@@ -1,0 +1,10 @@
+{
+  "name": "upply-ai",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "UPply AI Career Coach Lambda — calls OpenAI API",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0"
+  }
+}

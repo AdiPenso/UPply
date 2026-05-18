@@ -3,10 +3,7 @@
 // Stores all fields the registration form sends, including location.
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import {
-  DynamoDBDocumentClient,
-  PutCommand,
-} from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 
 const TABLE_NAME = process.env.USERS_TABLE || "Users";
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -18,39 +15,33 @@ const CORS_HEADERS = {
   "Content-Type": "application/json",
 };
 
-function ok(body) {
-  return { statusCode: 200, headers: CORS_HEADERS, body: JSON.stringify(body) };
-}
-function bad(msg, code = 400) {
-  return {
-    statusCode: code,
-    headers: CORS_HEADERS,
-    body: JSON.stringify({ error: msg }),
-  };
-}
+const ok  = (body)          => ({ statusCode: 200, headers: CORS_HEADERS, body: JSON.stringify(body) });
+const bad = (msg, code=400) => ({ statusCode: code, headers: CORS_HEADERS, body: JSON.stringify({ error: msg }) });
+
+const log = (level, msg, extra = {}) =>
+  console.log(JSON.stringify({ level, msg, ...extra, ts: new Date().toISOString() }));
 
 export const handler = async (event) => {
-  const method =
-    event.requestContext?.http?.method || event.httpMethod || "POST";
-
-  if (method === "OPTIONS") {
-    return { statusCode: 204, headers: CORS_HEADERS, body: "" };
-  }
+  const method = event.requestContext?.http?.method || event.httpMethod || "POST";
+  if (method === "OPTIONS") return { statusCode: 204, headers: CORS_HEADERS, body: "" };
 
   let body;
   try {
     body = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
   } catch {
+    log("warn", "Invalid JSON body");
     return bad("Invalid JSON body");
   }
   if (!body || typeof body !== "object") return bad("Missing body");
 
   const { user_id, email, first_name, last_name, phone, location } = body;
 
-  if (!user_id) return bad("Missing user_id");
-  if (!email) return bad("Missing email");
-  if (!first_name) return bad("Missing first_name");
-  if (!last_name) return bad("Missing last_name");
+  if (!user_id)    { log("warn", "Missing user_id");    return bad("Missing user_id"); }
+  if (!email)      { log("warn", "Missing email");      return bad("Missing email"); }
+  if (!first_name) { log("warn", "Missing first_name"); return bad("Missing first_name"); }
+  if (!last_name)  { log("warn", "Missing last_name");  return bad("Missing last_name"); }
+
+  log("info", "Creating new profile", { user_id, email, first_name, last_name });
 
   const item = {
     user_id,
@@ -61,21 +52,15 @@ export const handler = async (event) => {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
-
-  // Optional fields — only write if provided (DynamoDB is happy with missing attrs)
-  if (phone) item.phone = phone;
+  if (phone)    item.phone    = phone;
   if (location) item.location = location;
 
   try {
-    await ddb.send(
-      new PutCommand({
-        TableName: TABLE_NAME,
-        Item: item,
-      })
-    );
+    await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
+    log("info", "Profile created successfully", { user_id, email });
     return ok({ ok: true, profile: item });
   } catch (err) {
-    console.error("profile-post error:", err);
+    log("error", "profile-post failed", { user_id, error: err.message });
     return bad(err.message || "Create failed", 500);
   }
 };

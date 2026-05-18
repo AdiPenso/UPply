@@ -1,8 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
-import { getProfile, getActivity, updateProfile, updateActivityStatus, deleteActivity } from "../services/api";
+import {
+  getProfile, getActivity, updateProfile, updateActivityStatus, deleteActivity,
+  extractCV, getUploadUrl, uploadFileToS3, getDocuments,
+  saveDocument, setPrimaryDocument, deleteDocument, getDownloadUrl,
+} from "../services/api";
+import { extractPDFText } from "../utils/extractPDFText";
 
 // ── Activity status options ───────────────────────────────────────────────────
 const STATUS_OPTIONS = [
@@ -89,6 +94,15 @@ export default function AccountPage() {
   const [skills, setSkills] = useState([]);
   const [skillInput, setSkillInput] = useState("");
 
+  // CV upload / AI extraction state
+  // status: 'idle' | 'reading' | 'extracting' | 'done' | 'error'
+  const [cvState, setCvState] = useState({ status: "idle", data: null, fileName: null, error: null });
+  const cvFileRef = useRef(null);
+
+  // Uploaded CV files (from UserDocuments table)
+  const [documents, setDocuments] = useState([]);
+  const [docsLoading, setDocsLoading] = useState(false);
+
   useEffect(() => {
     loadProfile();
   }, []);
@@ -116,11 +130,16 @@ export default function AccountPage() {
       const cached = JSON.parse(localStorage.getItem(cacheKey) || "null");
       if (cached) setCachedName(cached);
 
-      // Profile (Users table) and activity (UserActivity table) are independent — fetch in parallel
+      // Profile, activity, and documents are all independent — fetch in parallel
       const [raw, act] = await Promise.all([
         getProfile(sub).catch(() => null),
         getActivity(sub).catch(() => null),
       ]);
+
+      // Load CV documents separately (non-critical — don't block profile render)
+      getDocuments(sub)
+        .then(({ documents: docs }) => setDocuments(docs || []))
+        .catch(() => {});
 
       if (act) {
         setActivity({
@@ -344,6 +363,127 @@ export default function AccountPage() {
     );
   };
 
+  // ── CV upload handlers ────────────────────────────────────────────────────
+
+  const handleCVFile = async (file) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      setCvState({ status: "error", data: null, fileName: file.name, error: "Only PDF files are supported. Please upload a .pdf resume." });
+      return;
+    }
+    setCvState({ status: "reading", data: null, fileName: file.name, error: null });
+    try {
+      // Run in parallel: get presigned S3 URL + extract text from PDF locally
+      const [{ upload_url, s3_key }, cvText] = await Promise.all([
+        getUploadUrl(userId, file.name),
+        extractPDFText(file),
+      ]);
+
+      // Upload the PDF bytes directly to S3
+      await uploadFileToS3(upload_url, file);
+
+      // AI extraction of profile fields
+      setCvState((s) => ({ ...s, status: "extracting" }));
+      const extracted = await extractCV(userId, cvText);
+
+      // Save metadata to UserDocuments table
+      // First CV uploaded becomes primary automatically
+      const docId     = `cv#${Date.now()}`;
+      const isPrimary = documents.length === 0;
+      await saveDocument(userId, { docId, s3Key: s3_key, fileName: file.name, cvText, isPrimary });
+
+      // Refresh the documents list
+      const { documents: updated } = await getDocuments(userId);
+      setDocuments(updated || []);
+
+      setCvState({ status: "done", data: extracted, fileName: file.name, error: null });
+    } catch (err) {
+      setCvState({ status: "error", data: null, fileName: file.name, error: err.message || "Upload failed. Please try again." });
+    }
+  };
+
+  const handleSetPrimary = async (doc) => {
+    // Optimistic update
+    setDocuments((prev) => prev.map((d) => ({ ...d, is_primary: d.doc_id === doc.doc_id })));
+    try {
+      await setPrimaryDocument(userId, doc.doc_id);
+    } catch {
+      // Roll back on failure
+      const { documents: updated } = await getDocuments(userId);
+      setDocuments(updated || []);
+      showStatusNotice("❌ Could not update primary CV.");
+    }
+  };
+
+  const handleDownload = async (doc) => {
+    try {
+      const { download_url } = await getDownloadUrl(userId, doc.doc_id);
+      window.open(download_url, "_blank");
+    } catch {
+      showStatusNotice("❌ Could not generate download link. Please try again.");
+    }
+  };
+
+  const handleDeleteDocument = (doc) => {
+    openConfirm(
+      `Delete "${doc.file_name}" permanently? This cannot be undone.`,
+      "Delete CV",
+      async () => {
+        // Optimistic removal
+        setDocuments((prev) => prev.filter((d) => d.doc_id !== doc.doc_id));
+        try {
+          await deleteDocument(userId, doc.doc_id);
+        } catch {
+          const { documents: updated } = await getDocuments(userId);
+          setDocuments(updated || []);
+          showStatusNotice("❌ Could not delete CV.");
+        }
+      }
+    );
+  };
+
+  const handleApplyCV = async () => {
+    const d = cvState.data;
+    if (!d) return;
+
+    // Merge extracted fields into the form (never blank-out existing values)
+    const mergedForm = {
+      ...form,
+      first_name:        d.first_name        || form.first_name,
+      last_name:         d.last_name         || form.last_name,
+      title:             d.title             || form.title,
+      years_experience:  d.years_experience  != null ? String(d.years_experience) : form.years_experience,
+      bio:               d.bio               || form.bio,
+      location:          d.location          || form.location,
+      desired_role:      d.desired_role      || form.desired_role,
+      desired_salary_min: d.desired_salary_min != null ? String(d.desired_salary_min) : form.desired_salary_min,
+      desired_salary_max: d.desired_salary_max != null ? String(d.desired_salary_max) : form.desired_salary_max,
+    };
+    setForm(mergedForm);
+
+    // Merge skills (deduplicated)
+    const mergedSkills = Array.isArray(d.skills) && d.skills.length > 0
+      ? [...new Set([...skills, ...d.skills])]
+      : skills;
+    if (Array.isArray(d.skills) && d.skills.length > 0) setSkills(mergedSkills);
+
+    // Persist everything to DynamoDB
+    await saveFields({
+      first_name:        mergedForm.first_name,
+      last_name:         mergedForm.last_name,
+      title:             mergedForm.title,
+      years_experience:  mergedForm.years_experience ? Number(mergedForm.years_experience) : "",
+      bio:               mergedForm.bio,
+      location:          mergedForm.location,
+      desired_role:      mergedForm.desired_role,
+      desired_salary_min: mergedForm.desired_salary_min ? Number(mergedForm.desired_salary_min) : "",
+      desired_salary_max: mergedForm.desired_salary_max ? Number(mergedForm.desired_salary_max) : "",
+      skills:            mergedSkills,
+    });
+
+    setCvState({ status: "idle", data: null, fileName: null, error: null });
+  };
+
   const handleLogout = async () => {
     await signOut();
     navigate("/login");
@@ -375,11 +515,21 @@ export default function AccountPage() {
   const interviewCount = activity.applied.filter(
     (a) => a.status === "interview" || a.status === "offer"
   ).length;
+
+  // Response rate = % of applications where the company responded
+  // (any status other than "applied" counts as a response)
+  const respondedCount = activity.applied.filter(
+    (a) => a.status && a.status !== "applied"
+  ).length;
+  const responseRate = activity.applied.length > 0
+    ? Math.round((respondedCount / activity.applied.length) * 100)
+    : null;
+
   const stats = {
     applied: activity.applied.length,
     interviews: interviewCount,
     saved: activity.saved.length,
-    response_rate: null,
+    response_rate: responseRate,
   };
 
   // Merge recent activity (most recent 5 across saves + applies) for sidebar card
@@ -488,7 +638,13 @@ export default function AccountPage() {
           label="Response Rate"
           value={stats.response_rate === null ? "—" : `${stats.response_rate}%`}
           accent="#f59e0b"
-          hint={stats.response_rate === null ? "No replies tracked yet" : null}
+          hint={
+            stats.response_rate === null
+              ? "No applications yet"
+              : stats.response_rate === 0
+              ? "Update statuses in Activity History to track this"
+              : null
+          }
         />
       </div>
 
@@ -781,21 +937,149 @@ export default function AccountPage() {
             </div>
           </Section>
 
-          {/* Resume */}
+          {/* Resume / CV Files */}
           <Section icon="📄" title="My Resume">
-            <div style={styles.resumeBox}>
-              <div style={styles.resumeIcon}>📄</div>
-              <div style={{ flex: 1 }}>
-                <div style={styles.resumeTitle}>No resume uploaded</div>
-                <div style={styles.resumeSub}>
-                  Upload your resume to apply faster (S3 upload — coming in the
-                  next step)
+
+            {/* ── Upload in progress ── */}
+            {(cvState.status === "reading" || cvState.status === "extracting") && (
+              <div style={styles.cvProcessing}>
+                <div style={styles.cvSpinner} />
+                <div>
+                  <div style={styles.cvProcessTitle}>
+                    {cvState.status === "reading"
+                      ? "Uploading & reading your PDF…"
+                      : "AI is extracting your profile data…"}
+                  </div>
+                  <div style={styles.cvProcessSub}>{cvState.fileName}</div>
                 </div>
               </div>
-              <button style={styles.resumeBtn} disabled title="Coming soon">
-                Upload PDF
-              </button>
-            </div>
+            )}
+
+            {/* ── Upload error ── */}
+            {cvState.status === "error" && (
+              <div style={styles.cvError}>
+                <span style={{ fontSize: "20px", flexShrink: 0 }}>⚠️</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: "700", fontSize: "13px", color: "#991b1b", marginBottom: "2px" }}>
+                    Upload failed
+                  </div>
+                  <div style={{ fontSize: "12px", color: "#b91c1c" }}>{cvState.error}</div>
+                </div>
+                <button
+                  style={styles.resumeUploadBtn}
+                  onClick={() => {
+                    setCvState({ status: "idle", data: null, fileName: null, error: null });
+                    cvFileRef.current?.click();
+                  }}
+                >
+                  Try again
+                </button>
+              </div>
+            )}
+
+            {/* ── Extracted data preview + apply ── */}
+            {cvState.status === "done" && cvState.data && (
+              <div style={styles.cvDone}>
+                <div style={styles.cvDoneHeader}>
+                  <span style={{ fontSize: "22px" }}>✅</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: "700", fontSize: "13px", color: "#065f46" }}>
+                      CV uploaded &amp; extracted!
+                    </div>
+                    <div style={{ fontSize: "12px", color: "#6b7280", marginTop: "2px" }}>
+                      {cvState.fileName}
+                    </div>
+                  </div>
+                  <button
+                    style={{ ...styles.resumeUploadBtn, fontSize: "11px", padding: "6px 12px" }}
+                    onClick={() => setCvState({ status: "idle", data: null, fileName: null, error: null })}
+                  >
+                    Dismiss
+                  </button>
+                </div>
+                <div style={styles.cvPreview}>
+                  {cvState.data.first_name && (
+                    <CvField label="Name" value={[cvState.data.first_name, cvState.data.last_name].filter(Boolean).join(" ")} />
+                  )}
+                  {cvState.data.title && <CvField label="Title" value={cvState.data.title} />}
+                  {cvState.data.years_experience != null && (
+                    <CvField label="Experience" value={`${cvState.data.years_experience} year${cvState.data.years_experience !== 1 ? "s" : ""}`} />
+                  )}
+                  {cvState.data.location && <CvField label="Location" value={cvState.data.location} />}
+                  {cvState.data.desired_role && <CvField label="Desired role" value={cvState.data.desired_role} />}
+                  {Array.isArray(cvState.data.skills) && cvState.data.skills.length > 0 && (
+                    <CvField
+                      label="Skills"
+                      value={cvState.data.skills.slice(0, 8).join(", ") + (cvState.data.skills.length > 8 ? ` +${cvState.data.skills.length - 8} more` : "")}
+                    />
+                  )}
+                  {cvState.data.bio && <CvField label="Bio" value={cvState.data.bio} />}
+                </div>
+                <button style={styles.cvApplyBtn} onClick={handleApplyCV}>
+                  ✨ Apply to profile &amp; Save
+                </button>
+              </div>
+            )}
+
+            {/* ── Documents list ── */}
+            {documents.length === 0 && cvState.status === "idle" && (
+              <div style={styles.resumeBox}>
+                <div style={styles.resumeIcon}>📄</div>
+                <div style={{ flex: 1 }}>
+                  <div style={styles.resumeTitle}>No CVs uploaded yet</div>
+                  <div style={styles.resumeSub}>
+                    Upload your PDF — AI will auto-fill your profile and your file will be saved securely.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {documents.length > 0 && (
+              <div style={styles.docList}>
+                {documents.map((doc) => (
+                  <div key={doc.doc_id} style={styles.docRow}>
+                    <span style={{ fontSize: "24px", flexShrink: 0 }}>📄</span>
+                    <div style={styles.docInfo}>
+                      <div style={styles.docName}>{doc.file_name}</div>
+                      <div style={styles.docDate}>
+                        {doc.uploaded_at
+                          ? new Date(doc.uploaded_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })
+                          : ""}
+                      </div>
+                    </div>
+                    {doc.is_primary && <span style={styles.primaryBadge}>⭐ Primary</span>}
+                    <div style={styles.docActions}>
+                      {!doc.is_primary && (
+                        <button style={styles.docActionBtn} onClick={() => handleSetPrimary(doc)}>
+                          Set primary
+                        </button>
+                      )}
+                      <button style={styles.docActionBtn} onClick={() => handleDownload(doc)}>
+                        ↓ Download
+                      </button>
+                      <button style={styles.docDeleteBtn} onClick={() => handleDeleteDocument(doc)}>
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ── Upload button ── */}
+            <button
+              style={{
+                ...styles.resumeUploadBtn,
+                width: "100%",
+                marginTop: documents.length > 0 || cvState.status !== "idle" ? "12px" : "0",
+                opacity: (cvState.status === "reading" || cvState.status === "extracting") ? 0.5 : 1,
+              }}
+              onClick={() => cvFileRef.current?.click()}
+              disabled={cvState.status === "reading" || cvState.status === "extracting"}
+            >
+              + Upload CV
+            </button>
+
           </Section>
         </div>
 
@@ -806,19 +1090,25 @@ export default function AccountPage() {
               <button style={styles.qaBtn} onClick={() => navigate("/home")}>
                 🔍 Find jobs
               </button>
+              <button
+                style={{ ...styles.qaBtn, ...styles.qaBtnActive }}
+                onClick={() => {
+                  setActiveTab("profile");
+                  // Small delay to ensure the profile tab (and the file input) is mounted
+                  setTimeout(() => cvFileRef.current?.click(), 50);
+                }}
+              >
+                📄 Upload CV
+              </button>
               <button style={styles.qaBtn} disabled title="Coming in Phase 2">
                 ✍️ Cover letter
               </button>
               <button style={styles.qaBtn} disabled title="Coming in Phase 2">
                 🎤 Mock interview
               </button>
-              <button style={styles.qaBtn} disabled title="Coming in Phase 2">
-                🧠 AI Coach
-              </button>
             </div>
             <p style={styles.qaNote}>
-              ✨ AI features will be powered by Amazon Bedrock — coming after we
-              wire profile saving.
+              ✨ Upload your CV and AI will auto-fill your profile in seconds.
             </p>
           </Card>
 
@@ -873,6 +1163,19 @@ export default function AccountPage() {
           </Card>
         </div>
       </div>}
+
+      {/* Hidden CV file input — always mounted so Quick Actions can trigger it */}
+      <input
+        ref={cvFileRef}
+        type="file"
+        accept=".pdf"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) handleCVFile(file);
+          e.target.value = ""; // allow re-selecting the same file
+        }}
+      />
 
       {/* ── Custom confirm modal (replaces window.confirm) ── */}
       {confirmModal && (
@@ -1005,6 +1308,15 @@ function StatCard({ label, value, accent, hint }) {
       <span style={styles.statLabel}>{label}</span>
       <span style={styles.statValue}>{value}</span>
       {hint && <span style={styles.statHint}>{hint}</span>}
+    </div>
+  );
+}
+
+function CvField({ label, value }) {
+  return (
+    <div style={styles.cvPreviewField}>
+      <span style={styles.cvPreviewLabel}>{label}</span>
+      <span style={styles.cvPreviewValue}>{value}</span>
     </div>
   );
 }
@@ -1393,15 +1705,188 @@ const styles = {
     color: "#6b7280",
     marginTop: "2px",
   },
-  resumeBtn: {
-    background: "#e5e7eb",
-    color: "#6b7280",
+  resumeUploadBtn: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    color: "#fff",
     border: "none",
     borderRadius: "10px",
     padding: "9px 16px",
     fontSize: "13px",
+    fontWeight: "700",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+    boxShadow: "0 3px 10px rgba(124,58,237,0.3)",
+    flexShrink: 0,
+  },
+
+  // CV processing / extracting state
+  cvProcessing: {
+    display: "flex",
+    alignItems: "center",
+    gap: "16px",
+    background: "#f5f3ff",
+    borderRadius: "12px",
+    padding: "18px 20px",
+    border: "1px solid #ddd6fe",
+  },
+  cvSpinner: {
+    width: "28px",
+    height: "28px",
+    borderRadius: "50%",
+    border: "3px solid #ddd6fe",
+    borderTopColor: "#7c3aed",
+    animation: "spin 0.8s linear infinite",
+    flexShrink: 0,
+  },
+  cvProcessTitle: {
+    fontSize: "14px",
+    fontWeight: "700",
+    color: "#5b21b6",
+  },
+  cvProcessSub: {
+    fontSize: "12px",
+    color: "#7c3aed",
+    marginTop: "2px",
+  },
+
+  // CV error state
+  cvError: {
+    display: "flex",
+    alignItems: "center",
+    gap: "14px",
+    background: "#fff1f2",
+    borderRadius: "12px",
+    padding: "14px 16px",
+    border: "1px solid #fecaca",
+  },
+
+  // CV done state
+  cvDone: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "14px",
+    background: "#f0fdf4",
+    borderRadius: "12px",
+    padding: "16px",
+    border: "1px solid #bbf7d0",
+  },
+  cvDoneHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+  },
+  cvPreview: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0",
+    background: "#ffffff",
+    borderRadius: "10px",
+    border: "1px solid #d1fae5",
+    overflow: "hidden",
+  },
+  cvPreviewField: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: "10px",
+    padding: "8px 12px",
+    borderBottom: "1px solid #f3f4f6",
+    fontSize: "13px",
+  },
+  cvPreviewLabel: {
+    minWidth: "90px",
+    fontWeight: "700",
+    color: "#6b7280",
+    fontSize: "11px",
+    textTransform: "uppercase",
+    letterSpacing: "0.5px",
+    flexShrink: 0,
+  },
+  cvPreviewValue: {
+    color: "#111827",
+    lineHeight: 1.4,
+    flex: 1,
+  },
+  cvApplyBtn: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    color: "#fff",
+    border: "none",
+    borderRadius: "12px",
+    padding: "13px",
+    fontSize: "14px",
+    fontWeight: "700",
+    cursor: "pointer",
+    width: "100%",
+    boxShadow: "0 4px 14px rgba(124,58,237,0.35)",
+  },
+
+  // Document list
+  docList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+  },
+  docRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    background: "#f9fafb",
+    border: "1px solid #e5e7eb",
+    borderRadius: "12px",
+    padding: "12px 14px",
+  },
+  docInfo: {
+    flex: 1,
+    minWidth: 0,
+  },
+  docName: {
+    fontSize: "13px",
+    fontWeight: "700",
+    color: "#111827",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  docDate: {
+    fontSize: "11px",
+    color: "#9ca3af",
+    marginTop: "2px",
+  },
+  primaryBadge: {
+    flexShrink: 0,
+    fontSize: "11px",
+    fontWeight: "700",
+    color: "#92400e",
+    background: "#fef3c7",
+    border: "1px solid #fde68a",
+    borderRadius: "999px",
+    padding: "3px 10px",
+    whiteSpace: "nowrap",
+  },
+  docActions: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    flexShrink: 0,
+  },
+  docActionBtn: {
+    background: "#ffffff",
+    border: "1px solid #e5e7eb",
+    borderRadius: "8px",
+    padding: "5px 10px",
+    fontSize: "11px",
     fontWeight: "600",
-    cursor: "not-allowed",
+    color: "#374151",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  docDeleteBtn: {
+    background: "transparent",
+    border: "none",
+    fontSize: "15px",
+    cursor: "pointer",
+    opacity: 0.45,
+    padding: "4px",
+    lineHeight: 1,
   },
 
   card: {
@@ -1432,6 +1917,12 @@ const styles = {
     color: "#374151",
     cursor: "pointer",
     textAlign: "left",
+  },
+  qaBtnActive: {
+    background: "linear-gradient(135deg, #f3e8ff 0%, #cffafe 100%)",
+    border: "1px solid #ddd6fe",
+    color: "#5b21b6",
+    cursor: "pointer",
   },
   qaNote: {
     fontSize: "11px",

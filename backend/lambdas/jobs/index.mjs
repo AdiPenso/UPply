@@ -2,6 +2,9 @@
 // Routes searches to JSearch (US/UK/global) or CareerJet (Israel).
 // Supports pagination: pass ?page=N (1-based, 10 results per page).
 
+const log = (level, msg, extra = {}) =>
+  console.log(JSON.stringify({ level, msg, ...extra, ts: new Date().toISOString() }));
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "Content-Type,Authorization",
@@ -62,8 +65,7 @@ async function fetchFromCareerJet(keywords, location, sourceIp, userAgent, page)
     },
   });
   const rawText = await res.text();
-  console.log("CareerJet status:", res.status);
-  console.log("CareerJet raw response (first 500 chars):", rawText.slice(0, 500));
+  log("info", "CareerJet response", { status: res.status, snippet: rawText.slice(0, 200) });
 
   if (!res.ok) throw new Error(`CareerJet HTTP ${res.status}: ${rawText.slice(0, 200)}`);
 
@@ -141,30 +143,35 @@ export const handler = async (event) => {
   const country   = qs.country   || detectCountry(location);
   const page      = Math.max(1, parseInt(qs.page || "1", 10));
 
+  log("info", "Jobs search request", { keywords, location, country, page });
+
   const sourceIp  = event.requestContext?.http?.sourceIp || event.requestContext?.identity?.sourceIp;
   const userAgent = event.headers?.["user-agent"] || event.headers?.["User-Agent"];
 
   try {
     const useCareerJet = country === "il";
 
+    const source = useCareerJet ? "careerjet" : "jsearch";
     const { jobs, total } = useCareerJet
       ? await fetchFromCareerJet(keywords, location, sourceIp, userAgent, page)
       : await fetchFromJSearch(keywords, location, country, page);
+
+    log("info", "Jobs search complete", { source, count: jobs.length, total, page });
 
     return {
       statusCode: 200,
       headers: CORS_HEADERS,
       body: JSON.stringify({
         jobs,
-        source: useCareerJet ? "careerjet" : "jsearch",
+        source,
         count: jobs.length,
         page,
         total,
-        has_more: jobs.length === 10,   // if we got a full page, assume there's more
+        has_more: jobs.length === 10,
       }),
     };
   } catch (err) {
-    console.error("Jobs lambda error:", err);
+    log("error", "Jobs search failed", { keywords, location, error: err.message });
     return {
       statusCode: 500,
       headers: CORS_HEADERS,

@@ -46,6 +46,9 @@ function bad(msg, code = 400) {
   };
 }
 
+const log = (level, msg, extra = {}) =>
+  console.log(JSON.stringify({ level, msg, ...extra, ts: new Date().toISOString() }));
+
 export const handler = async (event) => {
   const method =
     event.requestContext?.http?.method || event.httpMethod || "PUT";
@@ -64,6 +67,8 @@ export const handler = async (event) => {
 
   const userId = body.user_id;
   if (!userId) return bad("Missing user_id");
+
+  log("info", "Profile update request", { user_id: userId, fields: Object.keys(body).filter(k => k !== "user_id") });
 
   // Build dynamic UpdateExpression from whitelisted fields that are present.
   const sets = [];
@@ -118,9 +123,10 @@ export const handler = async (event) => {
         ReturnValues: "ALL_NEW",
       })
     );
+    log("info", "Profile updated successfully", { user_id: userId, updated_fields: idx });
     return ok({ profile: res.Attributes });
   } catch (err) {
-    console.error("profile-update error:", err);
+    log("error", "profile-update failed", { user_id: userId, error: err.message });
     return bad(err.message || "Update failed", 500);
   }
 };

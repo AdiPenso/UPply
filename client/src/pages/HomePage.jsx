@@ -2,7 +2,8 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
-import { fetchJobs, getProfile, getActivity, postActivity } from "../services/api";
+import { fetchJobs, getProfile, getActivity, postActivity, analyzeJobFit } from "../services/api";
+import AIChatPanel from "../components/AIChatPanel.jsx";
 
 // ── Job-results cache ─────────────────────────────────────────────────────────
 // We keep the last search result in sessionStorage so navigating to AccountPage
@@ -49,6 +50,9 @@ export default function HomePage() {
 
   // Apply confirmation modal
   const [applyModal, setApplyModal] = useState(null); // job object or null
+
+  // AI job-fit analysis modal: null | { job, result, loading }
+  const [analyzeModal, setAnalyzeModal] = useState(null);
 
   const navigate = useNavigate();
 
@@ -198,6 +202,18 @@ export default function HomePage() {
     navigate("/login");
   };
 
+  const handleAnalyze = async (job) => {
+    if (!userId) return;
+    // Open modal in loading state immediately
+    setAnalyzeModal({ job, result: null, loading: true });
+    try {
+      const result = await analyzeJobFit(userId, job);
+      setAnalyzeModal({ job, result, loading: false });
+    } catch (err) {
+      setAnalyzeModal({ job, result: null, loading: false, error: err.message });
+    }
+  };
+
   return (
     <div style={styles.page}>
       {/* Header */}
@@ -287,6 +303,7 @@ export default function HomePage() {
                 isSaved={savedJobs.has(job.url)}
                 onSave={() => handleSave(job)}
                 onApply={() => handleApply(job)}
+                onAnalyze={() => handleAnalyze(job)}
               />
             ))}
         </div>
@@ -351,13 +368,117 @@ export default function HomePage() {
           </div>
         </div>
       )}
+
+      {/* ── AI Job-Fit Analysis Modal ── */}
+      {analyzeModal && (
+        <div style={modalStyles.overlay}>
+          <div style={analyzeStyles.box}>
+            {/* Header */}
+            <div style={analyzeStyles.header}>
+              <div>
+                <div style={analyzeStyles.headerLabel}>🤖 AI Analysis</div>
+                <div style={analyzeStyles.headerJob}>
+                  {analyzeModal.job.title}
+                  {analyzeModal.job.company ? ` · ${analyzeModal.job.company}` : ""}
+                </div>
+              </div>
+              <button style={analyzeStyles.closeBtn} onClick={() => setAnalyzeModal(null)}>✕</button>
+            </div>
+
+            {/* Loading */}
+            {analyzeModal.loading && (
+              <div style={analyzeStyles.loadingWrap}>
+                <div style={analyzeStyles.loadingSpinner} />
+                <p style={analyzeStyles.loadingText}>Analyzing your fit…<br /><span style={{ fontSize: "12px", opacity: 0.7 }}>Comparing your profile to the job requirements</span></p>
+              </div>
+            )}
+
+            {/* Error */}
+            {!analyzeModal.loading && analyzeModal.error && (
+              <div style={analyzeStyles.errorWrap}>
+                <p style={{ color: "#991b1b", fontSize: "14px" }}>⚠️ {analyzeModal.error}</p>
+                <button style={analyzeStyles.retryBtn} onClick={() => handleAnalyze(analyzeModal.job)}>Try again</button>
+              </div>
+            )}
+
+            {/* Result */}
+            {!analyzeModal.loading && analyzeModal.result && (() => {
+              const r = analyzeModal.result;
+              const score = r.fit_score ?? 0;
+              const color = score >= 80 ? "#10b981" : score >= 60 ? "#3b82f6" : score >= 40 ? "#f59e0b" : "#ef4444";
+              return (
+                <div style={analyzeStyles.result}>
+                  {/* Score */}
+                  <div style={analyzeStyles.scoreRow}>
+                    <div style={{ ...analyzeStyles.scoreCircle, borderColor: color }}>
+                      <span style={{ ...analyzeStyles.scoreNum, color }}>{score}</span>
+                      <span style={analyzeStyles.scoreLabel}>/ 100</span>
+                    </div>
+                    <div>
+                      <div style={{ ...analyzeStyles.verdict, color }}>{r.verdict}</div>
+                      <div style={analyzeStyles.keyReqs}>
+                        {(r.key_requirements || []).map(req => (
+                          <span key={req} style={analyzeStyles.reqChip}>{req}</span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={analyzeStyles.sections}>
+                    {/* Strengths */}
+                    {r.strengths?.length > 0 && (
+                      <div style={analyzeStyles.section}>
+                        <div style={{ ...analyzeStyles.sectionTitle, color: "#065f46" }}>✅ Your strengths</div>
+                        {r.strengths.map((s, i) => <div key={i} style={{ ...analyzeStyles.item, background: "#f0fdf4", color: "#065f46" }}>• {s}</div>)}
+                      </div>
+                    )}
+                    {/* Gaps */}
+                    {r.gaps?.length > 0 && (
+                      <div style={analyzeStyles.section}>
+                        <div style={{ ...analyzeStyles.sectionTitle, color: "#92400e" }}>⚠️ Gaps to address</div>
+                        {r.gaps.map((g, i) => <div key={i} style={{ ...analyzeStyles.item, background: "#fffbeb", color: "#78350f" }}>• {g}</div>)}
+                      </div>
+                    )}
+                    {/* Recommendations */}
+                    {r.recommendations?.length > 0 && (
+                      <div style={analyzeStyles.section}>
+                        <div style={{ ...analyzeStyles.sectionTitle, color: "#1e40af" }}>💡 Recommended actions</div>
+                        {r.recommendations.map((rec, i) => <div key={i} style={{ ...analyzeStyles.item, background: "#eff6ff", color: "#1e40af" }}>• {rec}</div>)}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Actions */}
+                  <div style={analyzeStyles.actions}>
+                    <button
+                      style={{ ...analyzeStyles.actionBtn, background: savedJobs.has(analyzeModal.job.url) ? "#e5e7eb" : "linear-gradient(135deg,#7c3aed,#06b6d4)", color: savedJobs.has(analyzeModal.job.url) ? "#6b7280" : "#fff" }}
+                      onClick={() => { handleSave(analyzeModal.job); }}
+                    >
+                      {savedJobs.has(analyzeModal.job.url) ? "✓ Saved" : "🔖 Save Job"}
+                    </button>
+                    <button
+                      style={{ ...analyzeStyles.actionBtn, background: "#1f2937", color: "#fff" }}
+                      onClick={() => { handleApply(analyzeModal.job); setAnalyzeModal(null); }}
+                    >
+                      Apply →
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {/* ── AI Career Coach floating panel ── */}
+      <AIChatPanel userId={userId} />
     </div>
   );
 }
 
 // ── Job Card ──────────────────────────────────────────────────────────────────
 
-function JobCard({ job, isSaved, onSave, onApply }) {
+function JobCard({ job, isSaved, onSave, onApply, onAnalyze }) {
   return (
     <div style={cardStyles.card}>
       <div style={cardStyles.body}>
@@ -387,6 +508,9 @@ function JobCard({ job, isSaved, onSave, onApply }) {
         )}
       </div>
       <div style={cardStyles.actions}>
+        <button style={cardStyles.analyzeBtn} onClick={onAnalyze} title="AI job-fit analysis">
+          📊 Analyze
+        </button>
         <button
           style={isSaved ? cardStyles.savedBtn : cardStyles.saveBtn}
           onClick={onSave}
@@ -724,6 +848,17 @@ const cardStyles = {
     whiteSpace: "nowrap",
     boxShadow: "0 4px 12px rgba(124,58,237,0.3)",
   },
+  analyzeBtn: {
+    background: "#f3f4f6",
+    color: "#374151",
+    border: "1px solid #e5e7eb",
+    borderRadius: "10px",
+    padding: "9px 14px",
+    fontSize: "13px",
+    fontWeight: "600",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
 };
 
 // Skeleton placeholder dimensions
@@ -801,5 +936,113 @@ const modalStyles = {
     fontSize: "11px",
     color: "#9ca3af",
     margin: 0,
+  },
+};
+
+// ── Analysis modal styles ─────────────────────────────────────────────────────
+const analyzeStyles = {
+  box: {
+    background: "#ffffff",
+    borderRadius: "20px",
+    width: "min(560px, 94vw)",
+    maxHeight: "88vh",
+    overflowY: "auto",
+    boxShadow: "0 24px 60px rgba(0,0,0,0.22)",
+    display: "flex",
+    flexDirection: "column",
+  },
+  header: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    padding: "18px 20px",
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    borderRadius: "20px 20px 0 0",
+    flexShrink: 0,
+  },
+  headerLabel: { fontSize: "11px", fontWeight: "700", color: "rgba(255,255,255,0.8)", letterSpacing: "0.5px", textTransform: "uppercase", marginBottom: "4px" },
+  headerJob:   { fontSize: "15px", fontWeight: "700", color: "#fff" },
+  closeBtn: {
+    background: "rgba(255,255,255,0.15)",
+    border: "none",
+    borderRadius: "8px",
+    color: "#fff",
+    fontSize: "14px",
+    cursor: "pointer",
+    padding: "5px 9px",
+    flexShrink: 0,
+    marginLeft: "12px",
+  },
+  loadingWrap: {
+    padding: "48px 24px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: "16px",
+  },
+  loadingSpinner: {
+    width: "42px",
+    height: "42px",
+    border: "4px solid #e5e7eb",
+    borderTop: "4px solid #7c3aed",
+    borderRadius: "50%",
+    animation: "spin 0.9s linear infinite",
+  },
+  loadingText: { margin: 0, textAlign: "center", fontSize: "14px", color: "#6b7280", lineHeight: 1.6 },
+  errorWrap: { padding: "32px 24px", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: "12px" },
+  retryBtn: {
+    background: "linear-gradient(135deg,#7c3aed,#06b6d4)",
+    color: "#fff",
+    border: "none",
+    borderRadius: "10px",
+    padding: "8px 20px",
+    fontSize: "13px",
+    fontWeight: "700",
+    cursor: "pointer",
+  },
+  result: { padding: "20px", display: "flex", flexDirection: "column", gap: "16px" },
+  scoreRow: { display: "flex", alignItems: "center", gap: "20px" },
+  scoreCircle: {
+    width: "88px",
+    height: "88px",
+    borderRadius: "50%",
+    border: "5px solid",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  scoreNum:   { fontSize: "28px", fontWeight: "800", lineHeight: 1 },
+  scoreLabel: { fontSize: "11px", color: "#9ca3af", fontWeight: "600" },
+  verdict:    { fontSize: "18px", fontWeight: "800", marginBottom: "8px" },
+  keyReqs:    { display: "flex", flexWrap: "wrap", gap: "6px" },
+  reqChip: {
+    background: "#f3f4f6",
+    border: "1px solid #e5e7eb",
+    borderRadius: "999px",
+    padding: "3px 10px",
+    fontSize: "11px",
+    fontWeight: "600",
+    color: "#374151",
+  },
+  sections: { display: "flex", flexDirection: "column", gap: "12px" },
+  section:  { display: "flex", flexDirection: "column", gap: "6px" },
+  sectionTitle: { fontSize: "12px", fontWeight: "700", textTransform: "uppercase", letterSpacing: "0.4px" },
+  item: {
+    fontSize: "13px",
+    padding: "8px 12px",
+    borderRadius: "10px",
+    lineHeight: 1.5,
+  },
+  actions: { display: "flex", gap: "10px", paddingTop: "4px" },
+  actionBtn: {
+    flex: 1,
+    padding: "11px",
+    borderRadius: "12px",
+    border: "none",
+    fontSize: "14px",
+    fontWeight: "700",
+    cursor: "pointer",
   },
 };

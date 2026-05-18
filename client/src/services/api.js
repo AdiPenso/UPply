@@ -112,3 +112,135 @@ export const deleteActivity = async (userId, activityId) => {
   if (!res.ok) throw new Error(`deleteActivity failed: ${res.status}`);
   return res.json();
 };
+
+// ── Documents (CV files) ──────────────────────────────────────────────────────
+
+// Get a presigned S3 PUT URL so the browser can upload directly to S3.
+// Returns { upload_url, s3_key }
+export const getUploadUrl = async (userId, fileName) => {
+  const res = await fetch(`${API_BASE_URL}/upload-url`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, file_name: fileName }),
+  });
+  if (!res.ok) throw new Error(`getUploadUrl failed: ${res.status}`);
+  return res.json();
+};
+
+// Upload the actual PDF bytes directly to S3 using the presigned URL.
+// Must use PUT with Content-Type: application/pdf — no auth headers.
+export const uploadFileToS3 = async (presignedUrl, file) => {
+  const res = await fetch(presignedUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "application/pdf" },
+    body: file,
+  });
+  if (!res.ok) throw new Error(`S3 upload failed: ${res.status}`);
+};
+
+// List all CVs for a user. Returns { documents: [...] }
+export const getDocuments = async (userId) => {
+  const res = await fetch(`${API_BASE_URL}/documents?action=list&user_id=${userId}`);
+  if (!res.ok) throw new Error(`getDocuments failed: ${res.status}`);
+  return res.json();
+};
+
+// Save CV metadata to DynamoDB after a successful S3 upload.
+export const saveDocument = async (userId, { docId, s3Key, fileName, cvText, isPrimary }) => {
+  const res = await fetch(`${API_BASE_URL}/documents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id:    userId,
+      action:     "save",
+      doc_id:     docId,
+      s3_key:     s3Key,
+      file_name:  fileName,
+      cv_text:    cvText,
+      is_primary: isPrimary,
+    }),
+  });
+  if (!res.ok) throw new Error(`saveDocument failed: ${res.status}`);
+  return res.json();
+};
+
+// Mark one CV as the primary (used by AI for chat/analysis). Unmarks all others.
+export const setPrimaryDocument = async (userId, docId) => {
+  const res = await fetch(`${API_BASE_URL}/documents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, action: "set_primary", doc_id: docId }),
+  });
+  if (!res.ok) throw new Error(`setPrimaryDocument failed: ${res.status}`);
+  return res.json();
+};
+
+// Delete a CV from both DynamoDB and S3.
+export const deleteDocument = async (userId, docId) => {
+  const res = await fetch(`${API_BASE_URL}/documents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, action: "delete", doc_id: docId }),
+  });
+  if (!res.ok) throw new Error(`deleteDocument failed: ${res.status}`);
+  return res.json();
+};
+
+// Get a temporary (5-min) presigned download URL for one CV.
+export const getDownloadUrl = async (userId, docId) => {
+  const res = await fetch(
+    `${API_BASE_URL}/documents?action=download_url&user_id=${userId}&doc_id=${encodeURIComponent(docId)}`
+  );
+  if (!res.ok) throw new Error(`getDownloadUrl failed: ${res.status}`);
+  return res.json();
+};
+
+// ── AI Career Coach ───────────────────────────────────────────────────────────
+
+// Send a chat message to the AI career coach.
+// history = array of { role: "user"|"assistant", content: string }
+// Returns { reply: string }
+export const askAI = async (userId, message, history = []) => {
+  const res = await fetch(`${API_BASE_URL}/ai`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, mode: "chat", message, history }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`AI service error ${res.status}: ${txt.slice(0, 120)}`);
+  }
+  return res.json();
+};
+
+// Parse a CV/resume and extract structured profile data.
+// cvText = plain text extracted from the PDF client-side.
+// Returns { first_name, last_name, title, years_experience, skills, bio, location, ... }
+export const extractCV = async (userId, cvText) => {
+  const res = await fetch(`${API_BASE_URL}/ai`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, mode: "extract_cv", cv_text: cvText }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`CV extraction error ${res.status}: ${txt.slice(0, 120)}`);
+  }
+  return res.json();
+};
+
+// Analyze how well the user fits a specific job posting.
+// job = { title, company, location, description, url }
+// Returns { fit_score, verdict, strengths, gaps, recommendations, key_requirements }
+export const analyzeJobFit = async (userId, job) => {
+  const res = await fetch(`${API_BASE_URL}/ai`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, mode: "analyze_job", job }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Analysis error ${res.status}: ${txt.slice(0, 120)}`);
+  }
+  return res.json();
+};
