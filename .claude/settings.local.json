@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git -C \"C:/Users/user/Desktop/LastYear/AWS Project/UPply\" add client/src/services/api.js client/src/pages/LoginPage.jsx client/src/pages/CompleteProfilePage.jsx client/src/pages/HomePage.jsx client/src/pages/AccountPage.jsx)",
-      "Bash(git -C 'C:/Users/user/Desktop/LastYear/AWS Project/UPply' commit -m ' *)",
-      "Bash(git -C \"C:/Users/user/Desktop/LastYear/AWS Project/UPply\" push origin main)"
-    ]
-  }
-}
