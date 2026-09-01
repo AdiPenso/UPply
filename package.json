@@ -1,0 +1,13 @@
+{
+  "name": "upply",
+  "private": true,
+  "version": "1.0.0",
+  "description": "UPply — smart job-application platform (React SPA + serverless AWS backend). The app lives in client/; these scripts are convenience pass-throughs.",
+  "scripts": {
+    "dev": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "preview": "npm --prefix client run preview",
+    "lint": "npm --prefix client run lint",
+    "setup": "npm --prefix client install"
+  }
+}

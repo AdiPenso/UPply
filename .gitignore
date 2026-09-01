@@ -1,27 +1,41 @@
-# Dependencies
+# ── Dependencies ─────────────────────────────────────────────────────────────
 node_modules/
-client/node_modules/
 
-# Lambda build artifacts — zip files are uploaded to AWS, not stored in git
-backend/lambdas/*.zip
+# ── Frontend build output ────────────────────────────────────────────────────
+dist/
+dist-ssr/
+client/dist/
 
-# Lambda node_modules — installed locally before zipping, not needed in git
+# ── Lambda build artifacts ───────────────────────────────────────────────────
+# Deployment zips are uploaded to AWS, not stored in git.
+backend/lambdas/**/*.zip
+# Lambda dependencies are installed locally before zipping.
 backend/lambdas/*/node_modules/
 backend/lambdas/*/package-lock.json
 
-# Environment & secrets
+# ── Environment & secrets ────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
+*.local
 
-# Build output
-client/dist/
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# Editor & OS
+# ── Editor & OS ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
 .DS_Store
 Thumbs.db
 
-# Claude Code internal folder (settings, worktrees — all local only)
+# ── Tooling / local-only ─────────────────────────────────────────────────────
+# Claude Code internal folder (settings, worktrees — all local only).
 .claude/
