@@ -56,8 +56,10 @@ export default function HomePage() {
 
   const navigate = useNavigate();
 
+  // Run once on mount.
   useEffect(() => {
     initPage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const initPage = async () => {

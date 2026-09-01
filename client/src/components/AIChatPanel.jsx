@@ -42,7 +42,7 @@ export default function AIChatPanel({ userId }) {
   // Persist to sessionStorage
   useEffect(() => {
     try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(messages)); }
-    catch {}
+    catch { /* storage full or unavailable — chat still works in-memory */ }
   }, [messages]);
 
   const addMessage = (role, content, isError = false) =>
@@ -63,7 +63,7 @@ export default function AIChatPanel({ userId }) {
     try {
       const { reply } = await askAI(userId, text, history);
       addMessage("assistant", reply);
-    } catch (err) {
+    } catch {
       addMessage("assistant", "Sorry, I couldn't reach the AI service right now. Please try again in a moment.", true);
     } finally {
       setIsLoading(false);

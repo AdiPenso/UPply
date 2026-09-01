@@ -20,12 +20,11 @@ function ConfirmSignUpPage() {
     setIsSubmitting(true);
 
     try {
-      const result = await confirmSignUp({
+      await confirmSignUp({
         username: email,
         confirmationCode: code,
       });
 
-      console.log("Confirm success:", result);
       setSuccessMessage("Account confirmed successfully. You can now log in.");
 
       setTimeout(() => {

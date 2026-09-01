@@ -101,7 +101,6 @@ export default function AccountPage() {
 
   // Uploaded CV files (from UserDocuments table)
   const [documents, setDocuments] = useState([]);
-  const [docsLoading, setDocsLoading] = useState(false);
 
   useEffect(() => {
     loadProfile();
@@ -154,7 +153,6 @@ export default function AccountPage() {
         //   - DynamoDB GetItem: { Item: { first_name: "Lir", ... } }
         //   - wrapped: { profile: { first_name: "Lir", ... } }
         const data = raw?.Item || raw?.profile || raw || {};
-        console.log("Loaded profile from DynamoDB:", data);
         setProfile(data);
 
         // Write the authoritative name to the cache so every page sees it instantly.

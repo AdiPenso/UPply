@@ -17,7 +17,7 @@ function RegisterPage() {
     setIsSubmitting(true);
 
     try {
-      const result = await signUp({
+      await signUp({
         username: email,
         password,
         options: {
@@ -27,8 +27,6 @@ function RegisterPage() {
         },
       });
 
-      console.log("Sign up success:", result);
-      
       navigate("/confirm-signup", {
         state: { email },
       });
