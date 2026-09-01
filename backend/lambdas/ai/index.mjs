@@ -84,7 +84,7 @@ async function fetchActivityCounts(userId) {
       ExpressionAttributeValues: { ":u": userId },
       Select: "COUNT",
     }));
-    // Rough split: assume half are saves, half are applies (good enough for context)
+    // Total saved + applied rows — used only as a rough engagement signal in the prompt.
     return { total: res.Count || 0 };
   } catch {
     return { total: 0 };
@@ -93,7 +93,7 @@ async function fetchActivityCounts(userId) {
 
 // ── OpenAI helpers ────────────────────────────────────────────────────────────
 
-// Standard Chat Completions API — used for analyze_job and extract_cv
+// OpenAI Chat Completions API — used by all three modes (chat, analyze_job, extract_cv)
 async function callOpenAI(model, messages, maxTokens, temperature = 0.7) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY environment variable is not set");
@@ -155,7 +155,6 @@ async function handleChat(userId, message, history) {
     : "\n(No CV uploaded yet — advise based on profile fields only.)";
 
   const systemPrompt = `You are a personal AI career coach for ${profile.first_name || "the user"} on UPply, a job-search platform.
-You have access to real-time web search — use it when the user asks about current salary ranges, job market trends, company info, or anything that benefits from up-to-date data.
 
 ${profileContext(profile, actCounts)}
 ${cvSection}
@@ -163,7 +162,9 @@ ${cvSection}
 Your role:
 - Give honest, specific, actionable career advice.
 - Help with resume improvement, interview prep, job strategy, skill gaps.
-- When relevant, search the web for current data (salary benchmarks, industry trends, company reviews).
+- You do not have live web access. When the user asks about current salary
+  ranges or market trends, give general guidance from your training and tell
+  them to verify against an up-to-date source.
 - Keep replies concise (3–5 short paragraphs max). Use bullet points when helpful.
 - Be warm, encouraging, and professional.
 - If the user asks to search for jobs, tell them to use the search bar at the top and suggest good keywords for their situation.`;

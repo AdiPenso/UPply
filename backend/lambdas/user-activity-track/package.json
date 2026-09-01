@@ -1,7 +1,11 @@
 {
-  "name": "upply-user-activity-track-lambda",
+  "name": "upply-user-activity-track",
   "version": "1.0.0",
-  "description": "UPply /activity (POST) — writes save/unsave/apply events to UserActivity table",
+  "description": "UPply POST /activity endpoint — write save/unsave/apply/status/delete events to DynamoDB",
   "type": "module",
-  "main": "index.mjs"
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0"
+  }
 }

@@ -1,6 +1,7 @@
 {
-  "name": "upply-profile-update-lambda",
+  "name": "upply-profile-update",
   "version": "1.0.0",
+  "description": "UPply PUT /profile endpoint — update whitelisted profile fields in DynamoDB",
   "type": "module",
   "main": "index.mjs",
   "dependencies": {

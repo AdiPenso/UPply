@@ -1,6 +1,7 @@
 {
-  "name": "upply-profile-post-lambda",
+  "name": "upply-profile-post",
   "version": "1.0.0",
+  "description": "UPply POST /profile endpoint — create a user profile in DynamoDB on first login",
   "type": "module",
   "main": "index.mjs",
   "dependencies": {

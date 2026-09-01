@@ -104,11 +104,7 @@ export const handler = async (event) => {
   values[":updated_at"] = new Date().toISOString();
   sets.push("#updated_at = :updated_at");
 
-  if (Object.values(names).includes("first_name") === false) {
-    // no-op — just to keep linter calm
-  }
-
-  // We need a :null placeholder if we used it
+  // Add the :null placeholder only if at least one field is being cleared.
   const usesNull = sets.some((s) => s.includes(":null"));
   if (usesNull) values[":null"] = null;
 

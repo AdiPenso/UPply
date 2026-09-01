@@ -1,6 +1,7 @@
 {
-  "name": "upply-profile-get-lambda",
+  "name": "upply-profile-get",
   "version": "1.0.0",
+  "description": "UPply GET /profile endpoint — fetch a user profile from DynamoDB",
   "type": "module",
   "main": "index.mjs",
   "dependencies": {

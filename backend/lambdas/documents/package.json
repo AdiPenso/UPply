@@ -1,5 +1,9 @@
 {
+  "name": "upply-documents",
+  "version": "1.0.0",
+  "description": "UPply /documents endpoint — CV metadata CRUD in DynamoDB + S3 presigned download/delete",
   "type": "module",
+  "main": "index.mjs",
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.0.0",
     "@aws-sdk/lib-dynamodb": "^3.0.0",

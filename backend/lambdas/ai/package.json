@@ -1,8 +1,9 @@
 {
   "name": "upply-ai",
   "version": "1.0.0",
+  "description": "UPply /ai endpoint — AI career coach, job-fit analysis and CV parsing (OpenAI)",
   "type": "module",
-  "description": "UPply AI Career Coach Lambda — calls OpenAI API",
+  "main": "index.mjs",
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.0.0",
     "@aws-sdk/lib-dynamodb": "^3.0.0"

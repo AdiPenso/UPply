@@ -1,6 +1,7 @@
 {
-  "name": "upply-user-activity-get-lambda",
+  "name": "upply-user-activity-get",
   "version": "1.0.0",
+  "description": "UPply GET /activity endpoint — read a user's saved and applied jobs from DynamoDB",
   "type": "module",
   "main": "index.mjs",
   "dependencies": {
