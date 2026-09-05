@@ -208,7 +208,7 @@ const isRetryable = (e) => {
 // its { statusCode, body } response into a plain object. Retries throttling /
 // transient 5xx a few times with backoff.
 async function invokeLambda(fnName, opts = {}) {
-  const { method = "GET", query = null, body = null } = opts;
+  const { method = "GET", query = null, body = null, retries = 3 } = opts;
   const proxyEvent = {
     requestContext: { http: { method } },
     httpMethod: method,
@@ -219,13 +219,13 @@ async function invokeLambda(fnName, opts = {}) {
   const payload = Buffer.from(JSON.stringify(proxyEvent));
 
   let lastErr;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt) await sleep(250 * 2 ** (attempt - 1) + Math.random() * 200);
     try {
       return await invokeLambdaOnce(fnName, payload);
     } catch (e) {
       lastErr = e;
-      if (!isRetryable(e) || attempt === 3) throw e;
+      if (!isRetryable(e) || attempt === retries) throw e;
       console.warn(`invokeLambda ${fnName} retry ${attempt + 1}: ${e.message}`);
     }
   }
@@ -542,20 +542,23 @@ async function executeTool(userId, name, args) {
         (Array.isArray(args.titles) ? args.titles : [])
           .map((t) => String(t || "").trim().toLowerCase())
           .filter(Boolean)
-      )].slice(0, 6);
-      if (!titles.length) return { error: "Provide 3–6 job titles to search for." };
+      )].slice(0, 5);
+      if (!titles.length) return { error: "Provide 3–5 job titles to search for." };
       const location = args.location || "";
 
+      // Best-effort per title: no retries (a slow upstream shouldn't blow the
+      // whole turn's time budget — a title that fails just contributes nothing).
       const searchOne = (kw) => invokeLambda(FN.jobs, {
         method: "GET",
         query: { keywords: kw, location, page: "1" },
+        retries: 0,
       }).then(
         (d) => ({ kw, jobs: d.jobs || [] }),
         (e) => { console.warn("find_matching_jobs sub-search failed:", kw, e.message); return { kw, jobs: [] }; }
       );
 
-      // Limited concurrency (3) so several parallel title searches don't stampede
-      // the jobs Lambda and trip its concurrency limit.
+      // Limited concurrency so several parallel title searches don't stampede the
+      // jobs Lambda and trip its concurrency limit.
       const queue = [...titles];
       const collected = [];
       await Promise.all(
@@ -760,9 +763,13 @@ How to work:
   does — practising interviews, analysing a job, writing a cover letter, tracking
   applications, searching jobs — recommend UPply's own feature (name it and say
   where it is), or just do it with a tool. Only mention an external site or tool
-  as an extra, never as the primary suggestion. Example: for interview practice,
-  point them to the Mock Interview on the Account page, not to LeetCode mocks or
-  "practice with peers".
+  as an extra, never as the primary suggestion.
+- If the user asks how to prepare for interviews, your FIRST recommendation is
+  UPply's Mock Interview (Account page → "Mock interview"): describe it in a
+  sentence (role-specific questions, English or Hebrew, spoken, scored report,
+  technical / behavioural focus, continue for more). Only after that add a few
+  general tips. Do NOT tell them to "practise with peers" or use LeetCode/
+  Pramp/other mock-interview sites.
 - ALWAYS judge jobs against the candidate profile and CV above. Match seniority
   to their years of experience and current title — do NOT save or recommend
   "Senior" / "Lead" / "Staff" / "Principal" roles for a junior or entry-level
@@ -789,11 +796,11 @@ How to work:
   "intern" / "junior", use the plain role, widen the location (city then
   country), or try student/graduate-programme wording. Entry-level pools are
   small.
-- When you do have results, RANK them yourself against the profile/CV (seniority
-  fit, skill overlap, location, work-mode and salary preferences) and briefly say
-  why the ones you chose fit before saving them. If the choice hinges on one
-  specific posting, you may call analyze_job_fit on it — but not more than 2 per
-  turn (it is slow).
+- Never dump the raw search list. RANK the results against the profile/CV
+  (seniority fit, skill overlap, location, work-mode, salary) and present only
+  the best 3–5, each with a one-line reason it fits. Drop the weak ones. If the
+  user asked for "the best N", give exactly N. If the choice hinges on one
+  posting you may call analyze_job_fit on it — max 2 per turn (it is slow).
 - If, after broadening, nothing genuinely fits their level, say so honestly and
   suggest concrete next search terms instead of saving a poor fit.
 - Before any action that changes stored data (updating the profile, saving or
