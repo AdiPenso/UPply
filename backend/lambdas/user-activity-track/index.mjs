@@ -11,6 +11,7 @@ import {
   PutCommand,
   DeleteCommand,
   UpdateCommand,
+  QueryCommand,
 } from "@aws-sdk/lib-dynamodb";
 
 const TABLE_NAME = process.env.ACTIVITY_TABLE || "UserActivity";
@@ -39,6 +40,21 @@ const encodeUrl = (url) =>
     .replace(/=+$/, "");
 
 const VALID_STATUSES = ["applied", "interview", "offer", "accepted", "rejected"];
+
+// A job's stable identity. CareerJet ("jobviewtrack.com") returns a fresh
+// tracking URL for the same posting on every search, so the URL alone can't be
+// the dedup key — key on title|company when we have a title.
+const norm = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+const identityOf = (title, company) => `${norm(title)}|${norm(company)}`;
+
+async function listSavedRows(user_id) {
+  const res = await ddb.send(new QueryCommand({
+    TableName: TABLE_NAME,
+    KeyConditionExpression: "user_id = :u AND begins_with(activity_id, :p)",
+    ExpressionAttributeValues: { ":u": user_id, ":p": "save#" },
+  }));
+  return res.Items || [];
+}
 
 export const handler = async (event) => {
   const method = event.requestContext?.http?.method || event.httpMethod || "POST";
@@ -73,33 +89,56 @@ export const handler = async (event) => {
   try {
     // ── save ─────────────────────────────────────────────────────────────────
     if (action === "save") {
-      const urlKey = encodeUrl(job.job_url);
+      const identity = job.title ? identityOf(job.title, job.company) : null;
+      const existing = await listSavedRows(user_id);
+
+      // Same posting already saved? (same URL, or same title|company). Re-use its
+      // row so a re-search / re-save never creates a duplicate.
+      const match = existing.find((r) =>
+        r.job_url === job.job_url ||
+        (identity && identityOf(r.job_title, r.company) === identity)
+      );
+
+      const activity_id = match?.activity_id
+        || `save#${encodeUrl(identity || job.job_url)}`;
+
       await ddb.send(new PutCommand({
         TableName: TABLE_NAME,
         Item: {
           user_id,
-          activity_id: `save#${urlKey}`,
+          activity_id,
           action: "save",
           job_url:   job.job_url,
-          job_title: job.title    || "",
-          company:   job.company  || "",
-          location:  job.location || "",
-          timestamp,
+          job_title: job.title    || match?.job_title || "",
+          company:   job.company  || match?.company   || "",
+          location:  job.location || match?.location  || "",
+          timestamp: match?.timestamp || timestamp,   // keep the original save time
         },
       }));
-      log("info", "Job saved", { user_id, job_title: job.title, company: job.company });
-      return ok({ ok: true, action: "save" });
+      log("info", "Job saved", { user_id, job_title: job.title, company: job.company, deduped: !!match });
+      return ok({ ok: true, action: "save", deduped: !!match });
     }
 
     // ── unsave ────────────────────────────────────────────────────────────────
     if (action === "unsave") {
-      const urlKey = encodeUrl(job.job_url);
-      await ddb.send(new DeleteCommand({
+      const identity = job.title ? identityOf(job.title, job.company) : null;
+      const legacyKey = `save#${encodeUrl(job.job_url)}`;
+      const existing = await listSavedRows(user_id);
+
+      // Remove every row for this posting — matched by URL, by title|company, or
+      // by the legacy URL-only key. Clears older duplicates too.
+      const targets = existing.filter((r) =>
+        r.job_url === job.job_url ||
+        r.activity_id === legacyKey ||
+        (identity && identityOf(r.job_title, r.company) === identity)
+      );
+
+      await Promise.all(targets.map((r) => ddb.send(new DeleteCommand({
         TableName: TABLE_NAME,
-        Key: { user_id, activity_id: `save#${urlKey}` },
-      }));
-      log("info", "Job unsaved", { user_id, job_title: job.title });
-      return ok({ ok: true, action: "unsave" });
+        Key: { user_id, activity_id: r.activity_id },
+      }))));
+      log("info", "Job unsaved", { user_id, job_title: job.title, removed: targets.length });
+      return ok({ ok: true, action: "unsave", removed: targets.length });
     }
 
     // ── apply ─────────────────────────────────────────────────────────────────

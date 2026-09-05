@@ -379,10 +379,14 @@ const TOOLS = [
     type: "function",
     function: {
       name: "unsave_job",
-      description: "Remove a job from the user's saved list, identified by its job_url.",
+      description: "Remove a job from the user's saved list. Pass its job_url plus title and company if you have them (helps match the right row).",
       parameters: {
         type: "object",
-        properties: { job_url: { type: "string" } },
+        properties: {
+          job_url: { type: "string" },
+          title:   { type: "string" },
+          company: { type: "string" },
+        },
         required: ["job_url"],
       },
     },
@@ -628,7 +632,11 @@ async function executeTool(userId, name, args) {
     case "unsave_job":
       return invokeLambda(FN.activityTrack, {
         method: "POST",
-        body: { user_id: userId, action: "unsave", job: { job_url: args.job_url } },
+        body: {
+          user_id: userId,
+          action: "unsave",
+          job: { job_url: args.job_url, title: args.title, company: args.company },
+        },
       });
 
     case "track_application":
@@ -801,7 +809,9 @@ How to work:
 - Only call track_application after the user confirms they actually submitted the
   application. Applying happens on the employer's site, which you cannot do.
 - When you save or apply to jobs from a search, use the exact job_url from the
-  search results.
+  search results AND always pass the job's title and company too (never call
+  save_job with an empty title). Saving is idempotent by title+company, so
+  re-saving a job the user already has is harmless — but don't do it needlessly.
 - After acting, tell the user plainly what you did and why those jobs fit them.
 - The profile context above is a snapshot from the start of the turn; call
   get_my_profile / get_my_activity again if you need the current state.

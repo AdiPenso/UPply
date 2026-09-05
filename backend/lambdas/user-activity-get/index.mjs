@@ -69,10 +69,23 @@ export const handler = async (event) => {
     const byTimeDesc = (a, b) =>
       (b.timestamp || "").localeCompare(a.timestamp || "");
 
-    const saved = items
-      .filter((it) => it.action === "save")
-      .map(toJob)
-      .sort(byTimeDesc);
+    // Collapse duplicate saves of the same posting (older rows keyed on a
+    // CareerJet tracking URL that changed between searches). Keep the newest.
+    const norm = (s) => String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+    const dedupeByJob = (list) => {
+      const seen = new Set();
+      return list.filter((j) => {
+        const key = `${norm(j.title)}|${norm(j.company)}`;
+        if (key === "|") return true;        // no identity to dedupe on
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    };
+
+    const saved = dedupeByJob(
+      items.filter((it) => it.action === "save").map(toJob).sort(byTimeDesc)
+    );
     const applied = items
       .filter((it) => it.action === "apply")
       .map(toJob)
