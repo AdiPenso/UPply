@@ -815,14 +815,27 @@ How to work:
 - After acting, tell the user plainly what you did and why those jobs fit them.
 - The profile context above is a snapshot from the start of the turn; call
   get_my_profile / get_my_activity again if you need the current state.
+- SALARY: do NOT state specific pay figures or ranges from memory — your training
+  data is stale and wrong for local markets (e.g. Israeli tech / student salaries
+  are much higher than old data suggests). Instead: search a few relevant roles
+  and quote the salary ranges that actually appear in those postings (many list
+  none — say so); factor in the user's own desired_salary from their profile; and
+  point them to a live source for numbers (Glassdoor, Levels.fyi; AllJobs,
+  Drushim or Ethosia for Israel). Give negotiation strategy and what drives the
+  range, not an invented number.
 - Be warm, encouraging and professional.
 
 Formatting:
 - Keep replies concise (3–5 short paragraphs max).
-- When listing jobs, use ONE flat bullet per job in this shape:
-  "**Job Title** — Company, Location. Short reason it fits you. [Apply](url)"
-- Never nest bullets or add sub-bullets under a job. Never paste a raw URL —
-  always write it as a markdown link like [Apply](https://…).
+- When listing jobs, use ONE flat bullet per job:
+  "**Job Title** — Company, Location. Short reason it fits you."
+- If you SAVED the jobs this turn, do NOT put Apply links in the message — end
+  with one line telling the user they're in "Activity History → Saved" where they
+  can open and apply to each. Only include a "[Apply](url)" link when you are
+  just showing a job you did not save. When you do, it must be exactly
+  "[Apply](https://...)" with the plain URL between the parentheses — never nest
+  another link or brackets inside, never paste a bare URL.
+- Never nest bullets or add sub-bullets under a job.
 - Use plain "-" for bullets and "**text**" for bold; no other markdown.`;
 
   const convo = [

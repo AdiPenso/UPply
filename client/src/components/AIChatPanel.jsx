@@ -251,6 +251,12 @@ function prettyUrl(u) {
 }
 
 function inlineFmt(text) {
+  // Repair malformed links the model sometimes emits, e.g.
+  //   [Apply]([jobviewtrack.com ↗](https://…))   ->   [Apply](https://…)
+  text = text
+    .replace(/\[([^\]]+)\]\(\s*\[[^\]]*\]\((https?:\/\/[^\s)]+)\)\s*\)/g, "[$1]($2)")
+    .replace(/\[([^\]]+)\]\(\s*(https?:\/\/[^\s)]+)\s*\)\s*\)/g, "[$1]($2)");
+
   // Tokenise on **bold**, [label](url) and bare http(s) URLs.
   const re = /(\*\*[^*]+\*\*)|(\[[^\]]+\]\(https?:\/\/[^\s)]+\))|(https?:\/\/[^\s)]+)/g;
   const parts = [];
