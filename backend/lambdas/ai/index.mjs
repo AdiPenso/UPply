@@ -768,6 +768,10 @@ How to work:
   sub-role. E.g. for a software-development internship:
   "software engineer intern", "student software developer", "junior developer",
   "backend intern", "full stack intern". Pass them all in one call.
+- Call find_matching_jobs ONCE. If it returns results, rank those and move on to
+  saving — do NOT call it again with similar titles. Only search a second time if
+  the first call returned almost nothing, and then change the location or the
+  role family, not just reword the same titles.
 - Use search_jobs only when the user named ONE specific title/keyword to look
   for. Keep its keywords SHORT — a role plus at most one modifier ("frontend
   developer", "junior data analyst"). Both tools are keyword searches: every
@@ -819,6 +823,14 @@ Formatting:
 
   const actionsTaken = [];   // [{ label, mutating }]
   const toolTrace    = [];   // [{ tool, ok }]
+  let broadSearchDone = false; // find_matching_jobs is expensive — run it once
+
+  // Collapse repeated identical trace lines (e.g. two near-identical searches).
+  const traceLabels = () => {
+    const out = [];
+    for (const a of actionsTaken) if (out[out.length - 1] !== a.label) out.push(a.label);
+    return out;
+  };
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const msg = await callOpenAIRaw(CHAT_MODEL, convo, {
@@ -834,7 +846,7 @@ Formatting:
       log("info", "Chat reply generated", { user_id: userId, rounds: round, actions: actionsTaken.length });
       return {
         reply: (msg.content || "").trim(),
-        actions_taken: actionsTaken.map((a) => a.label),
+        actions_taken: traceLabels(),
         did_mutate: actionsTaken.some((a) => a.mutating),
       };
     }
@@ -842,6 +854,19 @@ Formatting:
     const runCall = async (tc) => {
       let args = {};
       try { args = JSON.parse(tc.function.arguments || "{}"); } catch { /* keep {} */ }
+
+      // find_matching_jobs fans out many sub-searches; a second call in the same
+      // turn roughly doubles latency for little gain. Allow it only if the first
+      // one came back nearly empty.
+      if (tc.function.name === "find_matching_jobs" && broadSearchDone) {
+        return {
+          role: "tool",
+          tool_call_id: tc.id,
+          content: JSON.stringify({
+            error: "Already searched this turn. Rank and save from the earlier results instead of searching again.",
+          }),
+        };
+      }
 
       let result;
       let success = true;
@@ -851,6 +876,10 @@ Formatting:
       } catch (err) {
         success = false;
         result = { error: err.message };
+      }
+
+      if (tc.function.name === "find_matching_jobs" && success && (result.count || 0) >= 3) {
+        broadSearchDone = true;
       }
 
       toolTrace.push({ tool: tc.function.name, ok: success });
@@ -903,7 +932,7 @@ Formatting:
   return {
     reply: (finalMsg.content || "").trim() ||
       "I ran out of steps before finishing — tell me which part to pick up and I'll continue.",
-    actions_taken: actionsTaken.map((a) => a.label),
+    actions_taken: traceLabels(),
     did_mutate: actionsTaken.some((a) => a.mutating),
   };
 }
