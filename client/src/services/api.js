@@ -40,25 +40,62 @@ export const updateProfile = async (userId, fields) => {
 
 // ── Jobs ──────────────────────────────────────────────────────────────────────
 
+// In-flight request de-dupe: React StrictMode (dev) fires effects twice, and a
+// user can double-click Search. Two concurrent hits to a cold / concurrency-
+// limited Lambda make API Gateway throttle one of them with a 503. Sharing the
+// same promise for an identical URL means we only ever have one request open.
+const jobsInFlight = new Map();
+
 // Search jobs. Lambda routes to CareerJet (Israel) or JSearch (everywhere else).
 // Returns { jobs: [...], hasMore: bool } — fetches one page of 10 at a time.
+// Retries a 5xx / network error a few times with backoff: a 503 here is almost
+// always API Gateway throttling the Lambda (it comes back in <1s), so a short
+// wait and another try usually lands on a free execution slot.
 export const fetchJobs = async (keywords, location, page = 1) => {
   const params = new URLSearchParams();
   if (keywords) params.set("keywords", keywords);
   if (location)  params.set("location", location);
   params.set("page", String(page));
+  const url = `${API_BASE_URL}/jobs?${params}`;
 
-  const res = await fetch(`${API_BASE_URL}/jobs?${params}`);
-  if (!res.ok) {
-    const text = await res.text();
-    console.error("Jobs API error:", res.status, text);
-    throw new Error(`Jobs API error ${res.status}`);
+  if (jobsInFlight.has(url)) return jobsInFlight.get(url);
+
+  const run = (async () => {
+    const delays = [0, 1200, 2500, 4000]; // immediate, then backoff
+    let lastErr;
+    for (let i = 0; i < delays.length; i++) {
+      if (delays[i]) {
+        // small jitter so retries from double-fired effects don't collide again
+        await new Promise((r) => setTimeout(r, delays[i] + Math.random() * 400));
+      }
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          const data = await res.json();
+          return {
+            jobs: data.jobs || [],
+            hasMore: data.has_more ?? (data.jobs?.length === 10),
+          };
+        }
+        // 4xx is a real client error — surface it immediately, no retry.
+        if (res.status < 500) throw new Error(`Jobs API error ${res.status}`);
+        lastErr = new Error(`Jobs API error ${res.status}`);
+        console.warn(`Jobs API ${res.status} — retrying (attempt ${i + 1}/${delays.length})`);
+      } catch (err) {
+        if (/Jobs API error 4\d\d/.test(err.message)) throw err;
+        lastErr = err;
+        console.warn(`Jobs fetch failed — retrying (attempt ${i + 1}/${delays.length}):`, err.message);
+      }
+    }
+    throw lastErr || new Error("Jobs API unavailable");
+  })();
+
+  jobsInFlight.set(url, run);
+  try {
+    return await run;
+  } finally {
+    jobsInFlight.delete(url);
   }
-  const data = await res.json();
-  return {
-    jobs: data.jobs || [],
-    hasMore: data.has_more ?? (data.jobs?.length === 10),
-  };
 };
 
 // ── Activity ──────────────────────────────────────────────────────────────────
@@ -225,6 +262,72 @@ export const extractCV = async (userId, cvText) => {
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`CV extraction error ${res.status}: ${txt.slice(0, 120)}`);
+  }
+  return res.json();
+};
+
+// Generate a tailored cover letter for a specific job.
+// job  = { title, company, description }
+// opts = { emphasis?, tone? }
+// Returns { cover_letter: string }
+export const generateCoverLetter = async (userId, job, opts = {}) => {
+  const res = await fetch(`${API_BASE_URL}/ai`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, mode: "cover_letter", job, ...opts }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Cover letter error ${res.status}: ${txt.slice(0, 120)}`);
+  }
+  return res.json();
+};
+
+// Rewrite the user's primary CV to fit a specific job (reorder / rephrase /
+// re-emphasise only — never invents). job = { title, company, description }.
+// Returns { has_cv: false } if no resume is on file, else { has_cv: true, resume }.
+export const tailorResume = async (userId, job) => {
+  const res = await fetch(`${API_BASE_URL}/ai`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, mode: "tailor_resume", job }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Resume tailoring error ${res.status}: ${txt.slice(0, 120)}`);
+  }
+  return res.json();
+};
+
+// Run one turn of a practice interview. The caller keeps the transcript and
+// sends the answered { question, answer } pairs back each turn.
+// opts = { language: "en"|"he", focus: "balanced"|"technical"|"behavioral",
+//          target: <question count for this round>, resume: <bool> }
+// Returns { feedback, question, report, number, total, done }
+export const runInterviewTurn = async (userId, job, transcript = [], opts = {}) => {
+  const res = await fetch(`${API_BASE_URL}/ai`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, mode: "interview", job, transcript, ...opts }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Interview error ${res.status}: ${txt.slice(0, 120)}`);
+  }
+  return res.json();
+};
+
+// Text → speech (OpenAI). Returns { audio: base64, format: "mp3" }.
+// Language is auto-detected from the text, so Hebrew text speaks Hebrew.
+export const synthesizeSpeech = async (text, voice) => {
+  const res = await fetch(`${API_BASE_URL}/ai`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: "tts", text, voice }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`TTS error ${res.status}: ${txt.slice(0, 120)}`);
   }
   return res.json();
 };

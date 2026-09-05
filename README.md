@@ -4,8 +4,10 @@
 
 UPply aggregates tech job listings from external providers, uses an LLM to score
 how well each posting fits the user's profile, tracks saved jobs and
-applications, and provides an AI career-coach chat. Final degree project for the
-*Cloud Computing Workshop with AWS* — Meshi Barabi & Adi Penso.
+applications, and provides an **AI career agent** — a chat assistant that can
+search jobs, save/apply to them, edit the profile and analyse fit on its own by
+invoking the other Lambdas as tools. Final degree project for the *Cloud
+Computing Workshop with AWS* — Meshi Barabi & Adi Penso.
 
 This README is a **guide to the codebase**: where things live and how the pieces
 fit together. For the product story, see the presentation and poster.
@@ -125,7 +127,7 @@ steps) is in **[`backend/lambdas/README.md`](backend/lambdas/README.md)**. Summa
 | `profile-get/` | `GET /profile` | Read a user profile from DynamoDB `Users` |
 | `profile-post/` | `POST /profile` | Create a profile on first login |
 | `profile-update/` | `PUT /profile` | Update whitelisted profile fields |
-| `jobs/` | `GET /jobs` | Job search — routes to **JSearch** (global) or **CareerJet** (Israel), normalizes both into one shape |
+| `jobs/` | `GET /jobs` | Job search — **CareerJet** for Israel (v4 API if `CAREERJET_API_KEY` set, else legacy), **JSearch** everywhere else and as the Israel fallback; normalizes, HTML-cleans and de-dups both into one shape |
 | `user-activity-get/` | `GET /activity` | Read saved + applied jobs |
 | `user-activity-track/` | `POST /activity` | Write `save` / `unsave` / `apply` / `update_status` / `delete` events |
 | `upload-url/` | `POST /upload-url` | Generate a presigned S3 PUT URL for a CV |
@@ -139,19 +141,49 @@ object per line to CloudWatch.
 ### AI logic
 
 **All AI code is in [`backend/lambdas/ai/index.mjs`](backend/lambdas/ai/index.mjs).**
-It calls the OpenAI Chat Completions API (`gpt-4.1-mini`) and dispatches on a
-`mode` field in the POST body:
+It calls the OpenAI Chat Completions API and dispatches on a `mode` field in the
+POST body. The language model is **`gpt-4.1-mini`** (the prompts are tuned for
+it); `AI_CHAT_MODEL` / `AI_JSON_MODEL` env vars let you swap in a cheaper model
+without a redeploy, and `callOpenAIRaw` handles GPT-5 / o-series parameter
+differences (`max_completion_tokens`, no `temperature`, `reasoning_effort`) if
+you do. Speech-to-text for the interview uses the **browser's Web Speech API**,
+not OpenAI; the interviewer's voice tries OpenAI TTS and falls back to the
+browser voice.
 
 | `mode` | Called from (frontend) | What it does |
 |---|---|---|
-| `chat` | `AIChatPanel.jsx` via `askAI()` | Career-coach chat. Loads the user's profile, **primary** CV text and activity count from DynamoDB, builds a system prompt, sends the last ~10 messages as history. |
+| `chat` | `AIChatPanel.jsx` via `askAI()` | **Agentic career assistant.** Loads the user's profile, **primary** CV text and activity count for context, then runs an OpenAI tool-calling loop (up to `MAX_TOOL_ROUNDS`, default 6). Returns `{ reply, actions_taken[], did_mutate }`. |
 | `analyze_job` | `HomePage.jsx` analysis modal via `analyzeJobFit()` | Compares profile ↔ job description, returns JSON: `fit_score` (0–100), `verdict`, `strengths`, `gaps`, `recommendations`, `key_requirements`. |
+| `cover_letter` | `AccountPage.jsx` "Cover letter" quick action via `generateCoverLetter()` | Writes a tailored cover letter (plain text, 150–200 words) from the profile + primary CV for a job `{ title, company, description }`, optional `emphasis`. Returns `{ cover_letter }`. |
+| `tailor_resume` | `HomePage.jsx` — the "Tailor my resume" step shown when **Apply** is clicked, via `tailorResume()` | Rewrites the user's **primary CV** to fit one posting — reorders / rephrases / re-emphasises only, never invents. Returns `{ has_cv: false }` (client tells the user to upload one) or `{ has_cv: true, resume }` (plain text, previewed before the external redirect). |
+| `interview` | `AccountPage.jsx` "Mock interview" quick action via `runInterviewTurn()` | One **stateless turn** of a practice interview — **English or Hebrew** (`language`), **balanced / technical / behavioral** (`focus`), default 5 questions (`target`, grows when the user asks to keep going — `resume: true` skips re-grading the last answer). Client sends `{ job, transcript: [{question, answer}], language, focus, target, resume }`; returns `{ feedback, question, number, total, done, report? }`. Reaching `target` returns a `report` (score, summary, strengths, improve, sample_answer) covering the whole interview so far; the UI then offers 3 more questions, optionally with a different focus. Answers typed or dictated (browser `SpeechRecognition`, `he-IL`/`en-US`). |
+| `tts` | `AccountPage.jsx` interview voice via `synthesizeSpeech()` | Text → speech via OpenAI (`gpt-4o-mini-tts`). Returns `{ audio }` (base64 mp3) the browser plays. No `user_id` — stateless, no PII. Language auto-detected from the text. |
 | `extract_cv` | `AccountPage.jsx` CV upload via `extractCV()` | Parses CV text into structured profile fields (title, skills, years of experience, summary, …). |
 
+**Agent tools** (`chat` mode) — each one invokes a sibling Lambda via the AWS SDK
+(`InvokeCommand`) with a synthetic API-Gateway event; `user_id` is always
+injected server-side so the agent can only touch the caller's own data:
+
+| Tool | Sibling Lambda | Kind |
+|---|---|---|
+| `search_jobs` | `jobs` | read |
+| `get_my_profile` / `update_my_profile` | `profile-get` / `profile-update` | read / write |
+| `get_my_activity` | `user-activity-get` | read |
+| `save_job` / `unsave_job` / `track_application` / `update_application_status` | `user-activity-track` | write |
+| `analyze_job_fit` | (in-process `analyze_job`) | read |
+| `draft_cover_letter` | (in-process `cover_letter`) | read |
+| `list_my_cvs` / `set_primary_cv` | `documents` | read / write |
+
+The agent has no delete tool. It is prompted to confirm before any write unless
+the user's message was already an explicit instruction. When a write happens
+(`did_mutate`), `AIChatPanel` calls its `onDataChanged` prop so `HomePage`
+refreshes the saved-jobs view.
+
 Helpers in that file: `fetchProfile`, `fetchPrimaryCV`, `fetchActivityCounts`
-(DynamoDB reads), `callOpenAI` (HTTP), `profileContext` (formats the profile for
-the prompt). Responses that must be JSON are parsed defensively (markdown-fence
-stripping + `try/catch`).
+(DynamoDB reads), `callOpenAIRaw` / `callOpenAI` (HTTP), `invokeLambda`
+(sibling-Lambda calls), `executeTool` (tool dispatch), `profileContext` (formats
+the profile for the prompt). Responses that must be JSON are parsed defensively
+(markdown-fence stripping + `try/catch`).
 
 The OpenAI key is read from `process.env.OPENAI_API_KEY` inside the Lambda and is
 never exposed to the browser.
@@ -191,8 +223,8 @@ the repo unpinned from one AWS account.
 
 | Lambda | Variables |
 |---|---|
-| `ai` | `OPENAI_API_KEY`, `USERS_TABLE`, `ACTIVITY_TABLE`, `DOCUMENTS_TABLE` |
-| `jobs` | `RAPIDAPI_KEY`, `CAREERJET_AFFID`, `CAREERJET_AFFILIATE_URL` |
+| `ai` | `OPENAI_API_KEY`, `USERS_TABLE`, `ACTIVITY_TABLE`, `DOCUMENTS_TABLE`, `MAX_TOOL_ROUNDS` (opt), `TTS_MODEL` / `TTS_VOICE` (opt — interview voice), `FN_JOBS` / `FN_ACTIVITY_GET` / `FN_ACTIVITY_TRACK` / `FN_PROFILE_GET` / `FN_PROFILE_UPDATE` / `FN_DOCUMENTS` (opt — deployed names of the sibling Lambdas the agent invokes; code defaults match the current deployment) |
+| `jobs` | `RAPIDAPI_KEY` (JSearch), `CAREERJET_API_KEY` (CareerJet v4 — recommended), `CAREERJET_LOCALE`, `CAREERJET_AFFID` / `CAREERJET_AFFILIATE_URL` (legacy path only) |
 | `documents` | `DOCUMENTS_TABLE`, `BUCKET_NAME` |
 | `upload-url` | `BUCKET_NAME` |
 | `profile-get`, `profile-post`, `profile-update` | `USERS_TABLE` |
@@ -240,7 +272,7 @@ To work on the backend, see **[`backend/lambdas/README.md`](backend/lambdas/READ
 | Compute | AWS Lambda (Node.js 20, ES modules) |
 | Database | Amazon DynamoDB |
 | File storage | Amazon S3 |
-| AI | OpenAI API (`gpt-4.1-mini`) |
+| AI | OpenAI API (`gpt-4.1-mini`); browser Web Speech API for STT |
 | External data | JSearch (RapidAPI), CareerJet |
 | Monitoring | Amazon CloudWatch |
 | Region | `us-east-1` |
@@ -251,7 +283,13 @@ To work on the backend, see **[`backend/lambdas/README.md`](backend/lambdas/READ
 
 - **API auth:** the Lambdas take `user_id` from the request and do not verify a
   Cognito token; the client sends no `Authorization` header. Adding an API
-  Gateway Cognito authorizer is the main planned hardening step.
+  Gateway Cognito authorizer is the main planned hardening step. The `ai` agent
+  mitigates this for its own tools by always injecting `user_id` server-side —
+  the model cannot direct a tool at another user's data.
+- **Agent IAM:** the `ai` Lambda's execution role needs `lambda:InvokeFunction`
+  on the six sibling functions it calls (already granted by the shared AWS
+  Academy `LabRole`), and its timeout is raised to 29 s (the API Gateway
+  ceiling) to allow multi-step tool loops.
 - **CORS** is currently open (`Access-Control-Allow-Origin: *`) on all functions.
 - `AccountPage.jsx` is large (~2k lines) — a candidate for splitting, kept as-is
   to avoid churn before submission.

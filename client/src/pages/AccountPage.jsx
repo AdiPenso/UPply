@@ -6,8 +6,10 @@ import {
   getProfile, getActivity, updateProfile, updateActivityStatus, deleteActivity,
   extractCV, getUploadUrl, uploadFileToS3, getDocuments,
   saveDocument, setPrimaryDocument, deleteDocument, getDownloadUrl,
+  generateCoverLetter, runInterviewTurn, synthesizeSpeech,
 } from "../services/api";
 import { extractPDFText } from "../utils/extractPDFText";
+import { clearUserSessionData } from "../utils/authCleanup";
 
 // ── Activity status options ───────────────────────────────────────────────────
 const STATUS_OPTIONS = [
@@ -27,34 +29,48 @@ const STATUS_STYLE = {
   rejected:  { background: "#fee2e2", color: "#991b1b", borderColor: "#fca5a5" },
 };
 
-// Fields we count toward "Profile strength"
-const STRENGTH_FIELDS = [
-  "first_name",
-  "last_name",
-  "email",
-  "phone",
-  "location",
-  "title",
-  "years_experience",
-  "desired_role",
-  "desired_salary_min",
-  "work_mode",
-  "skills",
-  "bio",
-];
+// Applied to interviewer text when the interview language is Hebrew.
+const rtl = { direction: "rtl", textAlign: "right" };
+
+// Once the OpenAI TTS endpoint returns "no model access", stop calling it for
+// the rest of the session and go straight to the browser voice — no point
+// firing a request that will always 403.
+let openaiTtsBlocked = false;
+
+// "Profile strength" is split in two halves that each add up to 50 points:
+//  - the essentials every account needs (name / contact / location)
+//  - the job-intent + depth fields that actually improve agent matching,
+//    weighted by how much each one helps (skills and bio matter most).
+// So a user who has filled every required field sits at ~50% and can see
+// exactly what pushes the rest of the bar.
+const STRENGTH_WEIGHTS = {
+  // essentials — 50 pts
+  first_name: 8,
+  last_name: 8,
+  email: 8,
+  phone: 10,
+  location: 16,
+  // job intent + depth — 50 pts
+  desired_role: 10,
+  title: 8,
+  years_experience: 8,
+  skills: 12,
+  bio: 7,
+  work_mode: 3,
+  desired_salary_min: 2,
+};
 
 function computeStrength(profile) {
   if (!profile) return 0;
-  let filled = 0;
-  for (const key of STRENGTH_FIELDS) {
+  let score = 0;
+  for (const [key, weight] of Object.entries(STRENGTH_WEIGHTS)) {
     const val = profile[key];
-    if (Array.isArray(val)) {
-      if (val.length > 0) filled++;
-    } else if (val !== undefined && val !== null && String(val).trim() !== "") {
-      filled++;
-    }
+    const filled = Array.isArray(val)
+      ? val.length > 0
+      : val !== undefined && val !== null && String(val).trim() !== "";
+    if (filled) score += weight;
   }
-  return Math.round((filled / STRENGTH_FIELDS.length) * 100);
+  return Math.min(100, Math.round(score));
 }
 
 export default function AccountPage() {
@@ -102,8 +118,31 @@ export default function AccountPage() {
   // Uploaded CV files (from UserDocuments table)
   const [documents, setDocuments] = useState([]);
 
+  // AI cover-letter modal.
+  // null = closed. Otherwise { title, company, description, emphasis,
+  //   status: 'idle'|'loading'|'done'|'error', text, error, copied }
+  const [coverLetter, setCoverLetter] = useState(null);
+
+  // AI mock-interview modal.
+  // null = closed. Otherwise {
+  //   status: 'setup'|'loading'|'active'|'done',
+  //   job: { title, company, description },
+  //   language: 'en'|'he', voiceOn: bool, speaking: bool,
+  //   transcript: [{ question, answer, feedback }],
+  //   question, number, total, feedback, report,
+  //   answer, error, listening }
+  const [interview, setInterview] = useState(null);
+  const recognitionRef = useRef(null);
+  const audioRef = useRef(null);
+
   useEffect(() => {
     loadProfile();
+  }, []);
+
+  // Stop any in-progress speech recognition / audio if the page unmounts.
+  useEffect(() => () => {
+    try { recognitionRef.current?.stop(); } catch { /* noop */ }
+    try { audioRef.current?.pause(); } catch { /* noop */ }
   }, []);
 
   const loadProfile = async () => {
@@ -482,7 +521,265 @@ export default function AccountPage() {
     setCvState({ status: "idle", data: null, fileName: null, error: null });
   };
 
+  // ── AI cover letter ──────────────────────────────────────────────────────
+
+  const openCoverLetter = () =>
+    setCoverLetter({
+      title: "", company: "", description: "", emphasis: "",
+      status: "idle", text: "", error: "", copied: false,
+    });
+
+  const runCoverLetter = async () => {
+    const cl = coverLetter;
+    if (!cl?.title.trim()) {
+      setCoverLetter((c) => ({ ...c, error: "Job title is required." }));
+      return;
+    }
+    setCoverLetter((c) => ({ ...c, status: "loading", error: "" }));
+    try {
+      const { cover_letter } = await generateCoverLetter(
+        userId,
+        { title: cl.title.trim(), company: cl.company.trim(), description: cl.description.trim() },
+        cl.emphasis.trim() ? { emphasis: cl.emphasis.trim() } : {}
+      );
+      setCoverLetter((c) => ({ ...c, status: "done", text: cover_letter || "" }));
+    } catch (err) {
+      setCoverLetter((c) => ({ ...c, status: "error", error: err.message || "Could not generate the letter." }));
+    }
+  };
+
+  const copyCoverLetter = async () => {
+    try {
+      await navigator.clipboard.writeText(coverLetter.text);
+      setCoverLetter((c) => ({ ...c, copied: true }));
+      setTimeout(() => setCoverLetter((c) => (c ? { ...c, copied: false } : c)), 2000);
+    } catch {
+      showStatusNotice("❌ Couldn't copy — select the text and copy manually.");
+    }
+  };
+
+  const downloadCoverLetter = () => {
+    const cl = coverLetter;
+    const safe = (cl.company || cl.title || "cover-letter")
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    const blob = new Blob([cl.text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `cover-letter-${safe || "job"}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // ── AI mock interview ────────────────────────────────────────────────────
+
+  const openInterview = () =>
+    setInterview({
+      status: "setup",
+      job: { title: "", company: "", description: "" },
+      language: "en", voiceOn: true, speaking: false,
+      focus: "balanced", target: 5,
+      transcript: [], question: "", number: 0, total: 5,
+      feedback: "", report: null, answer: "", error: "", listening: false,
+    });
+
+  const closeInterview = () => {
+    stopListening();
+    stopAudio();
+    setInterview(null);
+  };
+
+  const restartInterview = () => {
+    stopListening();
+    stopAudio();
+    setInterview((v) => ({
+      ...v, status: "setup", focus: "balanced", target: 5,
+      transcript: [], question: "", number: 0,
+      feedback: "", report: null, answer: "", error: "", listening: false, speaking: false,
+    }));
+  };
+
+  // Speak text: try the OpenAI voice, fall back to the browser's built-in
+  // speech synthesis, and surface a note only if neither works.
+  const speak = async (text, voiceOn, language = "en") => {
+    stopAudio();
+    if (!voiceOn || !text?.trim()) return;
+    setInterview((v) => (v ? { ...v, speaking: true, voiceError: false } : v));
+
+    if (openaiTtsBlocked) {
+      browserSpeak(text, language);
+      return;
+    }
+
+    try {
+      const { audio, format, disabled } = await synthesizeSpeech(text);
+      if (disabled) openaiTtsBlocked = true; // key has no audio access — stop asking
+      if (audio) {
+        const el = new Audio(`data:audio/${format || "mp3"};base64,${audio}`);
+        audioRef.current = el;
+        el.onended = () => setInterview((v) => (v ? { ...v, speaking: false } : v));
+        el.onerror = () => browserSpeak(text, language);
+        await el.play();
+        return;
+      }
+      browserSpeak(text, language);
+    } catch (err) {
+      // Project has no TTS-model access → don't retry OpenAI this session.
+      if (/403|does not have access|model_not_found/i.test(err.message)) {
+        openaiTtsBlocked = true;
+      }
+      console.warn("OpenAI TTS unavailable, using browser voice:", err.message);
+      browserSpeak(text, language);
+    }
+  };
+
+  // Fallback voice — Web Speech API. Quality depends on the OS voices installed.
+  const browserSpeak = (text, language) => {
+    try {
+      const synth = window.speechSynthesis;
+      if (!synth) {
+        setInterview((v) => (v ? { ...v, speaking: false, voiceError: true } : v));
+        return;
+      }
+      synth.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = language === "he" ? "he-IL" : "en-US";
+      const match = synth.getVoices().find(
+        (vo) => vo.lang && vo.lang.toLowerCase().startsWith(u.lang.slice(0, 2))
+      );
+      if (match) u.voice = match;
+      u.onend = () => setInterview((v) => (v ? { ...v, speaking: false } : v));
+      u.onerror = () => setInterview((v) => (v ? { ...v, speaking: false, voiceError: true } : v));
+      synth.speak(u);
+    } catch {
+      setInterview((v) => (v ? { ...v, speaking: false, voiceError: true } : v));
+    }
+  };
+
+  const stopAudio = () => {
+    try { audioRef.current?.pause(); } catch { /* noop */ }
+    audioRef.current = null;
+    try { window.speechSynthesis?.cancel(); } catch { /* noop */ }
+    setInterview((v) => (v && v.speaking ? { ...v, speaking: false } : v));
+  };
+
+  const startInterview = async () => {
+    const iv = interview;
+    if (!iv.job.title.trim()) {
+      setInterview((v) => ({ ...v, error: "Job title is required." }));
+      return;
+    }
+    setInterview((v) => ({ ...v, status: "loading", error: "", target: 5 }));
+    try {
+      const r = await runInterviewTurn(userId, iv.job, [], {
+        language: iv.language, focus: iv.focus, target: 5,
+      });
+      setInterview((v) => ({
+        ...v, status: "active",
+        question: r.question, number: r.number, total: r.total,
+        feedback: "", answer: "",
+      }));
+      speak(r.question, iv.voiceOn, iv.language);
+    } catch (err) {
+      setInterview((v) => ({ ...v, status: "setup", error: err.message || "Could not start the interview." }));
+    }
+  };
+
+  // Keep going after a report — add `count` more questions, optionally with a
+  // different focus (more technical / more behavioural).
+  const continueInterview = async (count = 3, nextFocus) => {
+    const iv = interview;
+    const focus = nextFocus || iv.focus;
+    const newTarget = iv.transcript.length + count;
+    stopListening();
+    stopAudio();
+    // Keep the existing report on screen (status stays effectively "done" data-wise)
+    // while loading — only cleared once the next question actually arrives.
+    setInterview((v) => ({ ...v, status: "loading", error: "", focus, target: newTarget }));
+    try {
+      const r = await runInterviewTurn(
+        userId, iv.job,
+        iv.transcript.map(({ question, answer }) => ({ question, answer })),
+        { language: iv.language, focus, target: newTarget, resume: true }
+      );
+      setInterview((v) => ({
+        ...v, status: "active", report: null,
+        question: r.question, number: r.number, total: r.total,
+        feedback: "", answer: "",
+      }));
+      speak(r.question, iv.voiceOn, iv.language);
+    } catch (err) {
+      setInterview((v) => ({ ...v, status: "done", error: err.message || "Couldn't load more questions." }));
+    }
+  };
+
+  const submitAnswer = async () => {
+    const iv = interview;
+    if (!iv.answer.trim() || iv.status === "loading") return;
+    stopListening();
+    stopAudio();
+
+    const answered = [...iv.transcript, { question: iv.question, answer: iv.answer.trim() }];
+    setInterview((v) => ({ ...v, status: "loading", error: "" }));
+    try {
+      const r = await runInterviewTurn(
+        userId, iv.job,
+        answered.map(({ question, answer }) => ({ question, answer })),
+        { language: iv.language, focus: iv.focus, target: iv.target }
+      );
+      // Attach the feedback to the answer it refers to (the one just submitted).
+      const withFeedback = answered.map((t, i) =>
+        i === answered.length - 1 ? { ...t, feedback: r.feedback } : t
+      );
+      if (r.done) {
+        setInterview((v) => ({ ...v, status: "done", transcript: withFeedback, report: r.report, feedback: r.feedback, answer: "" }));
+        // Nothing spoken on finish — the report is visual.
+      } else {
+        setInterview((v) => ({
+          ...v, status: "active", transcript: withFeedback,
+          question: r.question, number: r.number, feedback: r.feedback, answer: "",
+        }));
+        // Read only the question aloud, not the written feedback.
+        speak(r.question, iv.voiceOn, iv.language);
+      }
+    } catch (err) {
+      setInterview((v) => ({ ...v, status: "active", error: err.message || "Something went wrong — try that answer again." }));
+    }
+  };
+
+  // Browser speech-to-text for the answer box (Chrome/Edge). No API, no key.
+  const startListening = () => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      showStatusNotice("🎤 Voice input isn't supported in this browser — try Chrome or Edge.");
+      return;
+    }
+    const rec = new SR();
+    rec.lang = interview?.language === "he" ? "he-IL" : "en-US";
+    rec.interimResults = true;
+    rec.continuous = true;
+    const base = interview.answer ? interview.answer.trimEnd() + " " : "";
+    rec.onresult = (e) => {
+      let txt = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) txt += e.results[i][0].transcript;
+      setInterview((v) => (v ? { ...v, answer: base + txt } : v));
+    };
+    rec.onerror = () => setInterview((v) => (v ? { ...v, listening: false } : v));
+    rec.onend = () => setInterview((v) => (v ? { ...v, listening: false } : v));
+    rec.start();
+    recognitionRef.current = rec;
+    setInterview((v) => ({ ...v, listening: true }));
+  };
+
+  const stopListening = () => {
+    try { recognitionRef.current?.stop(); } catch { /* already stopped */ }
+    recognitionRef.current = null;
+  };
+
   const handleLogout = async () => {
+    clearUserSessionData();
     await signOut();
     navigate("/login");
   };
@@ -611,8 +908,10 @@ export default function AccountPage() {
             </div>
             <span style={styles.strengthHint}>
               {strength < 50
-                ? "Fill more fields to attract better matches"
-                : strength < 90
+                ? "Add your contact details to get started"
+                : strength < 80
+                ? "Add your role, experience and skills for better matches"
+                : strength < 100
                 ? "Looking great — almost there!"
                 : "Excellent — your profile is complete 🎉"}
             </span>
@@ -1098,10 +1397,18 @@ export default function AccountPage() {
               >
                 📄 Upload CV
               </button>
-              <button style={styles.qaBtn} disabled title="Coming in Phase 2">
+              <button
+                style={styles.qaBtn}
+                onClick={openCoverLetter}
+                title="Generate a tailored cover letter with AI"
+              >
                 ✍️ Cover letter
               </button>
-              <button style={styles.qaBtn} disabled title="Coming in Phase 2">
+              <button
+                style={styles.qaBtn}
+                onClick={openInterview}
+                title="Practice a role-specific interview with AI"
+              >
                 🎤 Mock interview
               </button>
             </div>
@@ -1174,6 +1481,422 @@ export default function AccountPage() {
           e.target.value = ""; // allow re-selecting the same file
         }}
       />
+
+      {/* ── AI Cover Letter modal ── */}
+      {coverLetter && (
+        <div
+          style={styles.modalOverlay}
+          onClick={(e) => { if (e.target === e.currentTarget) setCoverLetter(null); }}
+        >
+          <div style={styles.clCard}>
+            <div style={styles.clHeader}>
+              <div>
+                <div style={styles.clHeaderLabel}>✍️ AI Cover Letter</div>
+                <div style={styles.clHeaderSub}>
+                  Uses your profile
+                  {documents.some((d) => d.is_primary) ? " and primary CV" : ""}
+                </div>
+              </div>
+              <button style={styles.clClose} onClick={() => setCoverLetter(null)}>✕</button>
+            </div>
+
+            <div style={styles.clBody}>
+              {coverLetter.status === "loading" ? (
+                <div style={styles.clLoading}>
+                  <div style={styles.clSpinner} />
+                  <p style={styles.clLoadingText}>
+                    Writing your cover letter…
+                    <br />
+                    <span style={{ fontSize: "12px", opacity: 0.7 }}>
+                      Matching your CV to the job
+                    </span>
+                  </p>
+                </div>
+              ) : coverLetter.status === "done" ? (
+                <>
+                  <pre style={styles.clOutput}>{coverLetter.text}</pre>
+                  <div style={styles.clActions}>
+                    <button style={styles.clActionBtn} onClick={copyCoverLetter}>
+                      {coverLetter.copied ? "✓ Copied" : "📋 Copy"}
+                    </button>
+                    <button style={styles.clActionBtn} onClick={downloadCoverLetter}>
+                      ⬇ Download .txt
+                    </button>
+                    <button style={styles.clActionBtn} onClick={runCoverLetter}>
+                      ↻ Regenerate
+                    </button>
+                    <button
+                      style={styles.clActionBtn}
+                      onClick={() => setCoverLetter((c) => ({ ...c, status: "idle" }))}
+                    >
+                      ✎ Edit details
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>
+                      Job title <span style={styles.requiredStar}>*</span>
+                    </span>
+                    <input
+                      style={styles.input}
+                      value={coverLetter.title}
+                      placeholder="e.g. Frontend Developer"
+                      onChange={(e) => setCoverLetter((c) => ({ ...c, title: e.target.value }))}
+                    />
+                  </label>
+                  <label style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>Company</span>
+                    <input
+                      style={styles.input}
+                      value={coverLetter.company}
+                      placeholder="e.g. Wix"
+                      onChange={(e) => setCoverLetter((c) => ({ ...c, company: e.target.value }))}
+                    />
+                  </label>
+                  <label style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>
+                      Job description{" "}
+                      <span style={styles.clHint}>— paste it for the best result</span>
+                    </span>
+                    <textarea
+                      style={{ ...styles.input, ...styles.textarea, minHeight: "120px" }}
+                      value={coverLetter.description}
+                      placeholder="Paste the job posting here…"
+                      onChange={(e) => setCoverLetter((c) => ({ ...c, description: e.target.value }))}
+                    />
+                  </label>
+                  <label style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>
+                      Anything to emphasize? <span style={styles.clHint}>(optional)</span>
+                    </span>
+                    <input
+                      style={styles.input}
+                      value={coverLetter.emphasis}
+                      placeholder="e.g. my open-source React work"
+                      onChange={(e) => setCoverLetter((c) => ({ ...c, emphasis: e.target.value }))}
+                    />
+                  </label>
+
+                  {coverLetter.error && <p style={styles.clError}>⚠️ {coverLetter.error}</p>}
+
+                  <button
+                    style={{
+                      ...styles.clGenerateBtn,
+                      opacity: coverLetter.title.trim() ? 1 : 0.5,
+                      cursor: coverLetter.title.trim() ? "pointer" : "not-allowed",
+                    }}
+                    onClick={runCoverLetter}
+                    disabled={!coverLetter.title.trim()}
+                  >
+                    ✨ Generate cover letter
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── AI Mock Interview modal ── */}
+      {interview && (
+        <div
+          style={styles.modalOverlay}
+          onClick={(e) => { if (e.target === e.currentTarget) closeInterview(); }}
+        >
+          <div style={styles.clCard}>
+            <div style={styles.clHeader}>
+              <div>
+                <div style={styles.clHeaderLabel}>🎤 Mock Interview</div>
+                <div style={styles.clHeaderSub}>
+                  {interview.status === "setup" && "5 questions · type or speak your answers"}
+                  {interview.status === "loading" && "…"}
+                  {interview.status === "active" &&
+                    `${interview.job.title}${interview.job.company ? ` · ${interview.job.company}` : ""}` +
+                      (interview.language === "he" ? " · עברית" : "")}
+                  {interview.status === "done" && "Interview complete"}
+                </div>
+              </div>
+              <button style={styles.clClose} onClick={closeInterview}>✕</button>
+            </div>
+
+            <div style={styles.clBody}>
+              {/* Setup */}
+              {interview.status === "setup" && (
+                <>
+                  <label style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>
+                      Job title <span style={styles.requiredStar}>*</span>
+                    </span>
+                    <input
+                      style={styles.input}
+                      value={interview.job.title}
+                      placeholder="e.g. Frontend Developer"
+                      onChange={(e) => setInterview((v) => ({ ...v, job: { ...v.job, title: e.target.value } }))}
+                    />
+                  </label>
+                  <label style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>Company</span>
+                    <input
+                      style={styles.input}
+                      value={interview.job.company}
+                      placeholder="e.g. Monday.com"
+                      onChange={(e) => setInterview((v) => ({ ...v, job: { ...v.job, company: e.target.value } }))}
+                    />
+                  </label>
+                  <label style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>
+                      Job description{" "}
+                      <span style={styles.clHint}>— paste it to tailor the questions</span>
+                    </span>
+                    <textarea
+                      style={{ ...styles.input, ...styles.textarea, minHeight: "110px" }}
+                      value={interview.job.description}
+                      placeholder="Paste the job posting here…"
+                      onChange={(e) => setInterview((v) => ({ ...v, job: { ...v.job, description: e.target.value } }))}
+                    />
+                  </label>
+
+                  <div style={styles.clFieldLabel}>
+                    <span style={styles.fieldLabelText}>
+                      Focus <span style={styles.clHint}>— what to practice</span>
+                    </span>
+                    <div style={styles.ivSeg}>
+                      {[
+                        ["balanced", "Balanced"],
+                        ["technical", "Technical"],
+                        ["behavioral", "Behavioral"],
+                      ].map(([code, label]) => (
+                        <button
+                          key={code}
+                          style={{ ...styles.ivSegBtn, ...(interview.focus === code ? styles.ivSegBtnActive : {}) }}
+                          onClick={() => setInterview((v) => ({ ...v, focus: code }))}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={styles.ivOptRow}>
+                    <div style={styles.clFieldLabel}>
+                      <span style={styles.fieldLabelText}>Language</span>
+                      <div style={styles.ivSeg}>
+                        {[["en", "English"], ["he", "עברית"]].map(([code, label]) => (
+                          <button
+                            key={code}
+                            style={{ ...styles.ivSegBtn, ...(interview.language === code ? styles.ivSegBtnActive : {}) }}
+                            onClick={() => setInterview((v) => ({ ...v, language: code }))}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={styles.clFieldLabel}>
+                      <span style={styles.fieldLabelText}>Interviewer voice</span>
+                      <button
+                        style={{ ...styles.ivSegBtn, ...styles.ivVoiceToggle, ...(interview.voiceOn ? styles.ivSegBtnActive : {}) }}
+                        onClick={() => setInterview((v) => ({ ...v, voiceOn: !v.voiceOn }))}
+                      >
+                        {interview.voiceOn ? "🔊 On" : "🔇 Off"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {interview.error && <p style={styles.clError}>⚠️ {interview.error}</p>}
+                  <button
+                    style={{
+                      ...styles.clGenerateBtn,
+                      opacity: interview.job.title.trim() ? 1 : 0.5,
+                      cursor: interview.job.title.trim() ? "pointer" : "not-allowed",
+                    }}
+                    disabled={!interview.job.title.trim()}
+                    onClick={startInterview}
+                  >
+                    ▶ Start interview
+                  </button>
+                </>
+              )}
+
+              {/* Loading */}
+              {interview.status === "loading" && (
+                <div style={styles.clLoading}>
+                  <div style={styles.clSpinner} />
+                  <p style={styles.clLoadingText}>
+                    {interview.transcript.length === 0
+                      ? "Preparing your interview…"
+                      : interview.report
+                        ? "Preparing more questions…"
+                        : "The interviewer is considering your answer…"}
+                  </p>
+                </div>
+              )}
+
+              {/* Active question */}
+              {interview.status === "active" && (
+                <>
+                  <div>
+                    <div style={styles.ivProgress}>
+                      Question {interview.number} of {interview.total}
+                    </div>
+                    <div style={styles.ivBar}>
+                      <div
+                        style={{
+                          ...styles.ivBarFill,
+                          width: `${((interview.number - 1) / interview.total) * 100}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  {interview.feedback && (
+                    <div style={{ ...styles.ivFeedback, ...(interview.language === "he" ? rtl : {}) }}>
+                      💬 {interview.feedback}
+                    </div>
+                  )}
+
+                  <div style={styles.ivQuestionRow}>
+                    <div style={{ ...styles.ivQuestion, ...(interview.language === "he" ? rtl : {}), flex: 1 }}>
+                      {interview.question}
+                    </div>
+                    {interview.voiceOn && (
+                      <button
+                        style={{ ...styles.ivMicBtn, ...(interview.speaking ? styles.ivMicActive : {}), width: "36px", alignSelf: "flex-start" }}
+                        onClick={() =>
+                          interview.speaking
+                            ? stopAudio()
+                            : speak(interview.question, true, interview.language)
+                        }
+                        title={interview.speaking ? "Stop" : "Replay question"}
+                      >
+                        {interview.speaking ? "⏹" : "🔊"}
+                      </button>
+                    )}
+                  </div>
+
+                  <div style={styles.ivAnswerRow}>
+                    <textarea
+                      style={{ ...styles.input, ...styles.textarea, minHeight: "110px", flex: 1, ...(interview.language === "he" ? rtl : {}) }}
+                      value={interview.answer}
+                      placeholder={interview.language === "he" ? "התשובה שלך…" : "Your answer…"}
+                      onChange={(e) => setInterview((v) => ({ ...v, answer: e.target.value }))}
+                    />
+                    <button
+                      style={{ ...styles.ivMicBtn, ...(interview.listening ? styles.ivMicActive : {}) }}
+                      onClick={() => (interview.listening ? stopListening() : startListening())}
+                      title={interview.listening ? "Stop recording" : "Speak your answer"}
+                    >
+                      {interview.listening ? "⏺" : "🎤"}
+                    </button>
+                  </div>
+                  {interview.listening && (
+                    <div style={styles.clHint}>Listening… click the mic again to stop.</div>
+                  )}
+                  {interview.voiceError && (
+                    <div style={styles.clHint}>
+                      🔇 No voice available — your browser has no speech synthesis
+                      {interview.language === "he" ? " for Hebrew" : ""}. The interview still works in text.
+                    </div>
+                  )}
+                  {interview.error && <p style={styles.clError}>⚠️ {interview.error}</p>}
+
+                  <button
+                    style={{
+                      ...styles.clGenerateBtn,
+                      opacity: interview.answer.trim() ? 1 : 0.5,
+                      cursor: interview.answer.trim() ? "pointer" : "not-allowed",
+                    }}
+                    disabled={!interview.answer.trim()}
+                    onClick={submitAnswer}
+                  >
+                    {interview.number >= interview.total ? "Finish & see report →" : "Submit answer →"}
+                  </button>
+                </>
+              )}
+
+              {/* Report */}
+              {interview.status === "done" && interview.report && (() => {
+                const r = interview.report;
+                const score = r.score ?? 0;
+                const color =
+                  score >= 80 ? "#10b981" : score >= 60 ? "#3b82f6" : score >= 40 ? "#f59e0b" : "#ef4444";
+                const he = interview.language === "he";
+                return (
+                  <>
+                    <div style={styles.ivScoreRow}>
+                      <div style={{ ...styles.ivScoreCircle, borderColor: color }}>
+                        <span style={{ ...styles.ivScoreNum, color }}>{score}</span>
+                        <span style={styles.ivScoreLabel}>/ 100</span>
+                      </div>
+                      <p style={{ ...styles.ivSummary, ...(he ? rtl : {}) }}>{r.summary}</p>
+                    </div>
+
+                    {r.strengths?.length > 0 && (
+                      <div style={styles.ivSection}>
+                        <div style={{ ...styles.ivSectionTitle, color: "#065f46" }}>✅ {he ? "חוזקות" : "Strengths"}</div>
+                        {r.strengths.map((s, i) => (
+                          <div key={i} style={{ ...styles.ivItem, background: "#f0fdf4", color: "#065f46", ...(he ? rtl : {}) }}>• {s}</div>
+                        ))}
+                      </div>
+                    )}
+                    {r.improve?.length > 0 && (
+                      <div style={styles.ivSection}>
+                        <div style={{ ...styles.ivSectionTitle, color: "#92400e" }}>🎯 {he ? "לשיפור" : "Work on"}</div>
+                        {r.improve.map((s, i) => (
+                          <div key={i} style={{ ...styles.ivItem, background: "#fffbeb", color: "#78350f", ...(he ? rtl : {}) }}>• {s}</div>
+                        ))}
+                      </div>
+                    )}
+                    {r.sample_answer && (
+                      <div style={styles.ivSection}>
+                        <div style={{ ...styles.ivSectionTitle, color: "#1e40af" }}>💡 {he ? "תשובה חזקה יותר לדוגמה" : "Sample stronger answer"}</div>
+                        <div style={{ ...styles.ivItem, background: "#eff6ff", color: "#1e3a8a", lineHeight: 1.6, ...(he ? rtl : {}) }}>
+                          {r.sample_answer}
+                        </div>
+                      </div>
+                    )}
+
+                    <div style={styles.ivSection}>
+                      <div style={{ ...styles.ivSectionTitle, color: "#5b21b6" }}>
+                        {he ? "רוצה להמשיך לתרגל?" : "Want more practice?"}
+                      </div>
+                      <div style={styles.ivSeg}>
+                        {[
+                          ["balanced", "Balanced"],
+                          ["technical", "Technical"],
+                          ["behavioral", "Behavioral"],
+                        ].map(([code, label]) => (
+                          <button
+                            key={code}
+                            style={{ ...styles.ivSegBtn, ...(interview.focus === code ? styles.ivSegBtnActive : {}) }}
+                            onClick={() => setInterview((v) => ({ ...v, focus: code }))}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        style={styles.clGenerateBtn}
+                        onClick={() => continueInterview(3, interview.focus)}
+                      >
+                        ▶ {he ? "עוד 3 שאלות" : "3 more questions"}
+                      </button>
+                      {interview.error && <p style={styles.clError}>⚠️ {interview.error}</p>}
+                    </div>
+
+                    <div style={styles.clActions}>
+                      <button style={styles.clActionBtn} onClick={restartInterview}>↻ New interview</button>
+                      <button style={styles.clActionBtn} onClick={closeInterview}>Close</button>
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Custom confirm modal (replaces window.confirm) ── */}
       {confirmModal && (
@@ -2224,5 +2947,237 @@ const styles = {
     fontWeight: "700",
     cursor: "pointer",
     boxShadow: "0 4px 14px rgba(220,38,38,0.35)",
+  },
+
+  // ── Cover-letter modal ──────────────────────────────────────────────────────
+  clCard: {
+    background: "#ffffff",
+    borderRadius: "20px",
+    width: "min(620px, 94vw)",
+    maxHeight: "88vh",
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+    boxShadow: "0 24px 60px rgba(0,0,0,0.22)",
+  },
+  clHeader: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    padding: "16px 20px",
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    flexShrink: 0,
+  },
+  clHeaderLabel: { fontSize: "15px", fontWeight: "700", color: "#ffffff" },
+  clHeaderSub: { fontSize: "11px", color: "rgba(255,255,255,0.8)", marginTop: "3px" },
+  clClose: {
+    background: "rgba(255,255,255,0.15)",
+    border: "none",
+    borderRadius: "8px",
+    color: "#fff",
+    fontSize: "14px",
+    cursor: "pointer",
+    padding: "5px 9px",
+    flexShrink: 0,
+    marginLeft: "12px",
+  },
+  clBody: {
+    padding: "18px 20px 20px",
+    overflowY: "auto",
+    display: "flex",
+    flexDirection: "column",
+    gap: "12px",
+  },
+  clFieldLabel: { display: "flex", flexDirection: "column", gap: "6px" },
+  clHint: { fontSize: "11px", color: "#9ca3af", fontWeight: "400" },
+  clError: {
+    margin: 0,
+    fontSize: "13px",
+    color: "#991b1b",
+    background: "#fee2e2",
+    border: "1px solid #fecaca",
+    borderRadius: "10px",
+    padding: "8px 12px",
+  },
+  clGenerateBtn: {
+    marginTop: "4px",
+    padding: "12px",
+    borderRadius: "12px",
+    border: "none",
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    color: "#ffffff",
+    fontSize: "14px",
+    fontWeight: "700",
+    boxShadow: "0 4px 14px rgba(124,58,237,0.35)",
+  },
+  clLoading: {
+    padding: "44px 16px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: "16px",
+  },
+  clSpinner: {
+    width: "40px",
+    height: "40px",
+    border: "4px solid #e5e7eb",
+    borderTop: "4px solid #7c3aed",
+    borderRadius: "50%",
+    animation: "spin 0.9s linear infinite",
+  },
+  clLoadingText: { margin: 0, textAlign: "center", fontSize: "14px", color: "#6b7280", lineHeight: 1.6 },
+  clOutput: {
+    margin: 0,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    fontFamily: "inherit",
+    fontSize: "13px",
+    lineHeight: 1.65,
+    color: "#1f2937",
+    background: "#f9fafb",
+    border: "1px solid #e5e7eb",
+    borderRadius: "12px",
+    padding: "16px",
+    maxHeight: "42vh",
+    overflowY: "auto",
+  },
+  clActions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "8px",
+  },
+  clActionBtn: {
+    background: "#f3f4f6",
+    border: "1px solid #e5e7eb",
+    borderRadius: "10px",
+    padding: "8px 14px",
+    fontSize: "13px",
+    fontWeight: "600",
+    color: "#374151",
+    cursor: "pointer",
+  },
+
+  // ── Mock-interview modal ────────────────────────────────────────────────────
+  ivProgress: {
+    fontSize: "12px",
+    fontWeight: "700",
+    color: "#7c3aed",
+    marginBottom: "5px",
+  },
+  ivBar: {
+    height: "6px",
+    background: "#ede9fe",
+    borderRadius: "999px",
+    overflow: "hidden",
+  },
+  ivBarFill: {
+    height: "100%",
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    borderRadius: "999px",
+    transition: "width 0.3s ease",
+  },
+  ivFeedback: {
+    fontSize: "12.5px",
+    color: "#3730a3",
+    background: "#eef2ff",
+    border: "1px solid #e0e7ff",
+    borderRadius: "10px",
+    padding: "9px 12px",
+    lineHeight: 1.55,
+  },
+  ivQuestion: {
+    fontSize: "15px",
+    fontWeight: "700",
+    color: "#1f2937",
+    lineHeight: 1.5,
+  },
+  ivAnswerRow: {
+    display: "flex",
+    gap: "8px",
+    alignItems: "stretch",
+  },
+  ivMicBtn: {
+    flexShrink: 0,
+    width: "42px",
+    borderRadius: "10px",
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: "#e5e7eb",
+    background: "#f9fafb",
+    cursor: "pointer",
+    fontSize: "16px",
+  },
+  ivMicActive: {
+    background: "#fee2e2",
+    borderColor: "#fca5a5",
+  },
+  ivScoreRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "16px",
+  },
+  ivScoreCircle: {
+    width: "76px",
+    height: "76px",
+    borderRadius: "50%",
+    borderWidth: "5px",
+    borderStyle: "solid",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  ivScoreNum: { fontSize: "24px", fontWeight: "800", lineHeight: 1 },
+  ivScoreLabel: { fontSize: "10px", color: "#9ca3af", fontWeight: "600" },
+  ivSummary: { margin: 0, fontSize: "13px", color: "#374151", lineHeight: 1.6 },
+  ivSection: { display: "flex", flexDirection: "column", gap: "6px" },
+  ivSectionTitle: {
+    fontSize: "12px",
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: "0.4px",
+  },
+  ivItem: {
+    fontSize: "13px",
+    padding: "8px 12px",
+    borderRadius: "10px",
+    lineHeight: 1.5,
+  },
+  ivOptRow: {
+    display: "flex",
+    gap: "16px",
+    flexWrap: "wrap",
+  },
+  ivSeg: {
+    display: "flex",
+    gap: "4px",
+    background: "#f3f4f6",
+    borderRadius: "10px",
+    padding: "3px",
+  },
+  ivSegBtn: {
+    border: "none",
+    background: "transparent",
+    borderRadius: "8px",
+    padding: "7px 14px",
+    fontSize: "13px",
+    fontWeight: "600",
+    color: "#6b7280",
+    cursor: "pointer",
+  },
+  ivSegBtnActive: {
+    background: "#ffffff",
+    color: "#5b21b6",
+    boxShadow: "0 1px 3px rgba(0,0,0,0.12)",
+  },
+  ivVoiceToggle: {
+    background: "#f3f4f6",
+    alignSelf: "flex-start",
+  },
+  ivQuestionRow: {
+    display: "flex",
+    gap: "8px",
+    alignItems: "flex-start",
   },
 };

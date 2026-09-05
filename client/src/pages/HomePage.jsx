@@ -2,7 +2,9 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
-import { fetchJobs, getProfile, getActivity, postActivity, analyzeJobFit } from "../services/api";
+import { fetchJobs, getProfile, getActivity, postActivity, analyzeJobFit, tailorResume } from "../services/api";
+import { downloadResumePdf } from "../utils/resumePdf";
+import { clearUserSessionData } from "../utils/authCleanup";
 import AIChatPanel from "../components/AIChatPanel.jsx";
 
 // ── Job-results cache ─────────────────────────────────────────────────────────
@@ -22,6 +24,14 @@ function readJobsCache() {
   } catch { return null; }
 }
 
+// CareerJet's search API only returns a short snippet (often ending in "…").
+// Heuristic so the details modal can say "preview only".
+function isPreviewDescription(desc) {
+  if (!desc) return false;
+  const t = desc.trim();
+  return t.length < 500 || /(?:\.\.\.|…)\s*$/.test(t);
+}
+
 function writeJobsCache(kw, loc, pg, jobs, hasMore) {
   try {
     sessionStorage.setItem(
@@ -32,24 +42,37 @@ function writeJobsCache(kw, loc, pg, jobs, hasMore) {
 }
 
 export default function HomePage() {
-  const [jobs, setJobs] = useState([]);
+  // Read the warm job cache ONCE, synchronously, before the first paint. When the
+  // user navigates Account → Home this lets the feed render instantly instead of
+  // showing skeletons while unrelated profile/activity calls finish.
+  const [warmCache] = useState(readJobsCache);
+
+  const [jobs, setJobs] = useState(() => warmCache?.jobs ?? []);
   const [keywords, setKeywords] = useState("");
   const [location, setLocation] = useState("");
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(() => !warmCache);
   const [error, setError] = useState("");
   const [userName, setUserName] = useState("");
+  const [fullName, setFullName] = useState("");
   const [isReturning, setIsReturning] = useState(true);
   const [savedJobs, setSavedJobs] = useState(new Set());
   const [userId, setUserId] = useState("");
 
   // Pagination
-  const [page, setPage] = useState(1);
-  const [hasMore, setHasMore] = useState(false);
-  const [searchedKw, setSearchedKw] = useState("software developer");
-  const [searchedLoc, setSearchedLoc] = useState("");
+  const [page, setPage] = useState(() => warmCache?.page ?? 1);
+  const [hasMore, setHasMore] = useState(() => warmCache?.hasMore ?? false);
+  const [searchedKw, setSearchedKw] = useState(() => warmCache?.kw ?? "software developer");
+  const [searchedLoc, setSearchedLoc] = useState(() => warmCache?.loc ?? "");
 
-  // Apply confirmation modal
+  // Apply confirmation modal ("did you submit?")
   const [applyModal, setApplyModal] = useState(null); // job object or null
+
+  // Pre-apply "Tailor my resume" flow.
+  // null | { job, stage: 'options'|'loading'|'preview'|'noCV', resume, error, copied }
+  const [tailorModal, setTailorModal] = useState(null);
+
+  // Full job-details modal (no redirect — everything here is already in `job`)
+  const [viewModal, setViewModal] = useState(null); // job object or null
 
   // AI job-fit analysis modal: null | { job, result, loading }
   const [analyzeModal, setAnalyzeModal] = useState(null);
@@ -63,59 +86,53 @@ export default function HomePage() {
   }, []);
 
   const initPage = async () => {
+    // Fetch jobs straight away only when the cache was cold — the warm-cache case
+    // is already on screen from the initial state above. This is not gated behind
+    // auth / profile / activity, so the feed never waits on them.
+    if (!warmCache) {
+      searchJobs(searchedKw, searchedLoc, page);
+    }
+
+    // Profile, name and saved-job state load in the background and only update
+    // the header + Save buttons — they never touch `isLoading`.
     try {
       const session = await fetchAuthSession();
-      const payload = session?.tokens?.idToken?.payload || {};
-      const uid = payload.sub;
-      if (uid) setUserId(uid);
+      const uid = session?.tokens?.idToken?.payload?.sub;
+      if (!uid) return;
+      setUserId(uid);
 
       // First-visit detection via localStorage keyed by user id
-      const visitKey = uid ? `upply_visited_${uid}` : null;
-      const hasVisited = visitKey ? localStorage.getItem(visitKey) : null;
-      setIsReturning(!!hasVisited);
-      if (visitKey) localStorage.setItem(visitKey, "1");
+      const visitKey = `upply_visited_${uid}`;
+      setIsReturning(!!localStorage.getItem(visitKey));
+      localStorage.setItem(visitKey, "1");
 
       // Name — localStorage is the only fast path; Cognito JWT is never used
       // because it caches the old name until the next sign-in.
-      if (uid) {
-        const cacheKey = `upply_name_${uid}`;
-        const nameCached = JSON.parse(localStorage.getItem(cacheKey) || "null");
-        // Show the cached name instantly (no flicker) while DynamoDB loads.
-        if (nameCached?.first) setUserName(nameCached.first);
+      const cacheKey = `upply_name_${uid}`;
+      const nameCached = JSON.parse(localStorage.getItem(cacheKey) || "null");
+      if (nameCached?.first) setUserName(nameCached.first);
+      if (nameCached?.first || nameCached?.last) {
+        setFullName([nameCached.first, nameCached.last].filter(Boolean).join(" "));
+      }
 
-        const [profile, activity] = await Promise.all([
-          getProfile(uid).catch(() => null),
-          getActivity(uid).catch(() => null),
-        ]);
+      const [profile, activity] = await Promise.all([
+        getProfile(uid).catch(() => null),
+        getActivity(uid).catch(() => null),
+      ]);
 
-        if (profile?.first_name) {
-          setUserName(profile.first_name);
-          localStorage.setItem(
-            cacheKey,
-            JSON.stringify({ first: profile.first_name, last: profile.last_name || "" })
-          );
-        }
-        if (Array.isArray(activity?.saved)) {
-          setSavedJobs(new Set(activity.saved.map((j) => j.job_url)));
-        }
+      if (profile?.first_name) {
+        setUserName(profile.first_name);
+        setFullName([profile.first_name, profile.last_name].filter(Boolean).join(" "));
+        localStorage.setItem(
+          cacheKey,
+          JSON.stringify({ first: profile.first_name, last: profile.last_name || "" })
+        );
+      }
+      if (Array.isArray(activity?.saved)) {
+        setSavedJobs(new Set(activity.saved.map((j) => j.job_url)));
       }
     } catch (err) {
       console.warn("Could not load profile:", err);
-    }
-
-    // ── Restore job cache if still warm ──────────────────────────────────────
-    // If the user navigated away and back within 5 minutes, skip the network
-    // call and show the cached results immediately.
-    const jobsCache = readJobsCache();
-    if (jobsCache) {
-      setSearchedKw(jobsCache.kw);
-      setSearchedLoc(jobsCache.loc);
-      setPage(jobsCache.page);
-      setJobs(jobsCache.jobs);
-      setHasMore(jobsCache.hasMore);
-      setIsLoading(false);
-    } else {
-      searchJobs("software developer", "", 1);
     }
   };
 
@@ -164,6 +181,19 @@ export default function HomePage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  // Re-pull saved jobs — used after the AI agent changes activity from the chat.
+  const refreshSavedJobs = async () => {
+    if (!userId) return;
+    try {
+      const activity = await getActivity(userId);
+      if (Array.isArray(activity?.saved)) {
+        setSavedJobs(new Set(activity.saved.map((j) => j.job_url)));
+      }
+    } catch (err) {
+      console.warn("Could not refresh saved jobs:", err);
+    }
+  };
+
   const trackActivity = async (action, job) => {
     if (!userId) return;
     try {
@@ -185,13 +215,68 @@ export default function HomePage() {
     trackActivity(isSaved ? "unsave" : "save", job);
   };
 
-  // Open the URL immediately, then ask if they actually submitted
+  // Apply flow: first offer to tailor the resume, then continue to the posting.
   const handleApply = (job) => {
+    setTailorModal({ job, stage: "options", resume: "", error: "", copied: false });
+  };
+
+  // Runs the AI tailoring against the user's primary CV.
+  const runTailorResume = async () => {
+    const job = tailorModal.job;
+    setTailorModal((m) => ({ ...m, stage: "loading", error: "" }));
+    try {
+      const { has_cv, resume } = await tailorResume(userId, job);
+      if (!has_cv) {
+        setTailorModal((m) => ({ ...m, stage: "noCV" }));
+        return;
+      }
+      setTailorModal((m) => ({ ...m, stage: "preview", resume: resume || "" }));
+    } catch (err) {
+      setTailorModal((m) => ({ ...m, stage: "options", error: err.message || "Couldn't tailor the resume." }));
+    }
+  };
+
+  const copyTailored = async () => {
+    try {
+      await navigator.clipboard.writeText(tailorModal.resume);
+      setTailorModal((m) => ({ ...m, copied: true }));
+      setTimeout(() => setTailorModal((m) => (m ? { ...m, copied: false } : m)), 2000);
+    } catch { /* clipboard blocked — user can select the text */ }
+  };
+
+  const downloadTailoredPdf = async () => {
+    const job = tailorModal.job;
+    try {
+      await downloadResumePdf(tailorModal.resume, fullName || userName, job.company || job.title);
+    } catch {
+      setTailorModal((m) => (m ? { ...m, error: "Couldn't build the PDF — use Copy or the .txt download." } : m));
+    }
+  };
+
+  const downloadTailoredTxt = () => {
+    const job = tailorModal.job;
+    const safe = (job.company || job.title || "resume")
+      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    const blob = new Blob([tailorModal.resume], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `resume-${safe || "job"}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // Leave the tailor modal → open the external posting → show the "did you submit?" prompt.
+  const proceedToApply = () => {
+    const job = tailorModal.job;
+    setTailorModal(null);
     window.open(job.url, "_blank", "noopener,noreferrer");
     setApplyModal(job);
   };
 
-  // Called when user answers Yes/No in the modal
+  // Called when user answers Yes/No in the "did you submit?" modal
   const confirmApply = async (didApply) => {
     if (didApply && applyModal) {
       await trackActivity("apply", applyModal);
@@ -200,6 +285,7 @@ export default function HomePage() {
   };
 
   const handleLogout = async () => {
+    clearUserSessionData();
     await signOut();
     navigate("/login");
   };
@@ -306,6 +392,7 @@ export default function HomePage() {
                 onSave={() => handleSave(job)}
                 onApply={() => handleApply(job)}
                 onAnalyze={() => handleAnalyze(job)}
+                onView={() => setViewModal(job)}
               />
             ))}
         </div>
@@ -340,6 +427,123 @@ export default function HomePage() {
         )}
       </div>
 
+      {/* ── Tailor-my-resume flow (shown when Apply is clicked) ── */}
+      {tailorModal && (
+        <div
+          style={modalStyles.overlay}
+          onClick={(e) => {
+            // Backdrop click closes only on the options screen (no work to lose)
+            if (e.target === e.currentTarget && tailorModal.stage === "options") setTailorModal(null);
+          }}
+        >
+          <div style={viewStyles.box}>
+            <div style={viewStyles.header}>
+              <div style={{ minWidth: 0 }}>
+                <div style={viewStyles.headerTitle}>
+                  {tailorModal.stage === "preview" ? "Your tailored resume" : "Before you apply"}
+                </div>
+                <div style={viewStyles.headerCompany}>
+                  {tailorModal.job.title}
+                  {tailorModal.job.company ? ` · ${tailorModal.job.company}` : ""}
+                </div>
+              </div>
+              <button style={analyzeStyles.closeBtn} onClick={() => setTailorModal(null)}>✕</button>
+            </div>
+
+            {/* Options */}
+            {tailorModal.stage === "options" && (
+              <>
+                <div style={{ ...viewStyles.body, gap: "14px" }}>
+                  <p style={tailorStyles.lead}>
+                    Want the AI to reorder and rephrase your resume to match this role
+                    before you head to the application? It only re-emphasises what's
+                    already in your CV — it never adds anything.
+                  </p>
+                  {tailorModal.error && <p style={tailorStyles.error}>⚠️ {tailorModal.error}</p>}
+                </div>
+                <div style={viewStyles.actions}>
+                  <button
+                    style={{ ...cardStyles.saveBtn, flex: 1 }}
+                    onClick={proceedToApply}
+                  >
+                    Skip →
+                  </button>
+                  <button
+                    style={{ ...cardStyles.applyBtn, flex: 1.4 }}
+                    onClick={runTailorResume}
+                  >
+                    ✨ Tailor my resume
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* Loading */}
+            {tailorModal.stage === "loading" && (
+              <div style={{ ...viewStyles.body, alignItems: "center", justifyContent: "center", padding: "48px 20px" }}>
+                <div style={tailorStyles.spinner} />
+                <p style={tailorStyles.loadingText}>
+                  Tailoring your resume to this role…
+                  <br />
+                  <span style={{ fontSize: "12px", opacity: 0.7 }}>Matching your experience to the job requirements</span>
+                </p>
+              </div>
+            )}
+
+            {/* No CV on file */}
+            {tailorModal.stage === "noCV" && (
+              <>
+                <div style={{ ...viewStyles.body, gap: "12px" }}>
+                  <p style={tailorStyles.lead}>
+                    📄 You don't have a resume on file yet. Upload one on your Account
+                    page and UPply can tailor it to any job (and auto-fill your profile).
+                  </p>
+                </div>
+                <div style={viewStyles.actions}>
+                  <button style={{ ...cardStyles.saveBtn, flex: 1 }} onClick={proceedToApply}>
+                    Continue without it →
+                  </button>
+                  <button
+                    style={{ ...cardStyles.applyBtn, flex: 1.2 }}
+                    onClick={() => navigate("/account")}
+                  >
+                    Upload a resume
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* Preview */}
+            {tailorModal.stage === "preview" && (
+              <>
+                <div style={viewStyles.body}>
+                  <div style={tailorStyles.note}>
+                    ✅ Reordered and rephrased from your existing resume — nothing invented.
+                    Review it, then download the PDF to attach to your application.
+                  </div>
+                  <pre style={tailorStyles.resumeBox}>{tailorModal.resume}</pre>
+                  <button style={tailorStyles.textLink} onClick={downloadTailoredTxt}>
+                    or download as plain .txt
+                  </button>
+                  {tailorModal.error && <p style={tailorStyles.error}>⚠️ {tailorModal.error}</p>}
+                </div>
+                <div style={viewStyles.actions}>
+                  <button style={{ ...cardStyles.saveBtn, flex: 1 }} onClick={copyTailored}>
+                    {tailorModal.copied ? "✓ Copied" : "📋 Copy"}
+                  </button>
+                  <button style={{ ...cardStyles.analyzeBtn, flex: 1 }} onClick={downloadTailoredPdf}>
+                    ⬇ Download PDF
+                  </button>
+                  <button style={{ ...cardStyles.applyBtn, flex: 1.2 }} onClick={proceedToApply}>
+                    Continue to application →
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Apply confirmation modal — cannot be dismissed without answering */}
       {applyModal && (
         <div style={modalStyles.overlay}>
@@ -367,6 +571,101 @@ export default function HomePage() {
             <p style={modalStyles.note}>
               Please answer to continue — this keeps your stats accurate.
             </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Job Details Modal (no redirect — just what we already fetched) ── */}
+      {viewModal && (
+        <div
+          style={modalStyles.overlay}
+          onClick={(e) => { if (e.target === e.currentTarget) setViewModal(null); }}
+        >
+          <div style={viewStyles.box}>
+            <div style={viewStyles.header}>
+              <div style={{ minWidth: 0 }}>
+                <div style={viewStyles.headerTitle}>{viewModal.title}</div>
+                <div style={viewStyles.headerCompany}>{viewModal.company || "Unknown company"}</div>
+              </div>
+              <button style={analyzeStyles.closeBtn} onClick={() => setViewModal(null)}>✕</button>
+            </div>
+
+            <div style={viewStyles.body}>
+              <div style={viewStyles.factsGrid}>
+                {viewModal.location && (
+                  <div style={viewStyles.fact}>
+                    <span style={viewStyles.factIcon}>📍</span>
+                    <div>
+                      <div style={viewStyles.factLabel}>Location</div>
+                      <div style={viewStyles.factValue}>
+                        {viewModal.location}{viewModal.isRemote ? " · Remote" : ""}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {viewModal.type && (
+                  <div style={viewStyles.fact}>
+                    <span style={viewStyles.factIcon}>🕐</span>
+                    <div>
+                      <div style={viewStyles.factLabel}>Job type</div>
+                      <div style={viewStyles.factValue}>{viewModal.type}</div>
+                    </div>
+                  </div>
+                )}
+                {viewModal.salary && (
+                  <div style={viewStyles.fact}>
+                    <span style={viewStyles.factIcon}>💰</span>
+                    <div>
+                      <div style={viewStyles.factLabel}>Salary</div>
+                      <div style={viewStyles.factValue}>{viewModal.salary}</div>
+                    </div>
+                  </div>
+                )}
+                {viewModal.date && (
+                  <div style={viewStyles.fact}>
+                    <span style={viewStyles.factIcon}>📅</span>
+                    <div>
+                      <div style={viewStyles.factLabel}>Posted</div>
+                      <div style={viewStyles.factValue}>{viewModal.date}</div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <div style={viewStyles.sectionLabel}>Description</div>
+                <div style={viewStyles.descriptionBox}>
+                  {viewModal.description || "No description provided for this posting."}
+                </div>
+                {isPreviewDescription(viewModal.description) && (
+                  <div style={viewStyles.previewHint}>
+                    ℹ️ This source gives a short preview only — open the full posting with
+                    <b> Apply</b> to read everything.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div style={viewStyles.actions}>
+              <button
+                style={{ ...(savedJobs.has(viewModal.url) ? cardStyles.savedBtn : cardStyles.saveBtn), flex: 1 }}
+                onClick={() => handleSave(viewModal)}
+              >
+                {savedJobs.has(viewModal.url) ? "✓ Saved" : "🔖 Save"}
+              </button>
+              <button
+                style={{ ...cardStyles.analyzeBtn, flex: 1 }}
+                onClick={() => { setViewModal(null); handleAnalyze(viewModal); }}
+              >
+                📊 Analyze
+              </button>
+              <button
+                style={{ ...cardStyles.applyBtn, flex: 1 }}
+                onClick={() => { setViewModal(null); handleApply(viewModal); }}
+              >
+                Apply →
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -472,17 +771,21 @@ export default function HomePage() {
         </div>
       )}
 
-      {/* ── AI Career Coach floating panel ── */}
-      <AIChatPanel userId={userId} />
+      {/* ── AI Career Agent floating panel ── */}
+      <AIChatPanel userId={userId} onDataChanged={refreshSavedJobs} />
     </div>
   );
 }
 
 // ── Job Card ──────────────────────────────────────────────────────────────────
 
-function JobCard({ job, isSaved, onSave, onApply, onAnalyze }) {
+function JobCard({ job, isSaved, onSave, onApply, onAnalyze, onView }) {
+  // Any click on the card opens the details panel; the action buttons stop the
+  // click from bubbling up so they still do their own thing.
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
+
   return (
-    <div style={cardStyles.card}>
+    <div style={cardStyles.card} onClick={onView} title="Click for full details">
       <div style={cardStyles.body}>
         <h3 style={cardStyles.title}>{job.title}</h3>
         <p style={cardStyles.company}>{job.company}</p>
@@ -510,16 +813,16 @@ function JobCard({ job, isSaved, onSave, onApply, onAnalyze }) {
         )}
       </div>
       <div style={cardStyles.actions}>
-        <button style={cardStyles.analyzeBtn} onClick={onAnalyze} title="AI job-fit analysis">
+        <button style={cardStyles.analyzeBtn} onClick={stop(onAnalyze)} title="AI job-fit analysis">
           📊 Analyze
         </button>
         <button
           style={isSaved ? cardStyles.savedBtn : cardStyles.saveBtn}
-          onClick={onSave}
+          onClick={stop(onSave)}
         >
           {isSaved ? "✓ Saved" : "Save"}
         </button>
-        <button style={cardStyles.applyBtn} onClick={onApply}>
+        <button style={cardStyles.applyBtn} onClick={stop(onApply)}>
           Apply →
         </button>
       </div>
@@ -773,6 +1076,7 @@ const cardStyles = {
     justifyContent: "space-between",
     alignItems: "flex-start",
     gap: "16px",
+    cursor: "pointer",
   },
   body: { flex: 1, minWidth: 0 },
   title: {
@@ -1008,7 +1312,8 @@ const analyzeStyles = {
     width: "88px",
     height: "88px",
     borderRadius: "50%",
-    border: "5px solid",
+    borderWidth: "5px",
+    borderStyle: "solid",
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
@@ -1046,5 +1351,156 @@ const analyzeStyles = {
     fontSize: "14px",
     fontWeight: "700",
     cursor: "pointer",
+  },
+};
+
+// ── Job details modal styles ─────────────────────────────────────────────────
+const viewStyles = {
+  // The box itself never scrolls — only `body` does — so the header and the
+  // Save/Analyze/Apply footer always stay in view, even for a long posting.
+  box: {
+    background: "#ffffff",
+    borderRadius: "20px",
+    width: "min(600px, 94vw)",
+    maxHeight: "86vh",
+    boxShadow: "0 24px 60px rgba(0,0,0,0.22)",
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+  },
+  header: {
+    background: "linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%)",
+    padding: "20px",
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: "12px",
+    flexShrink: 0,
+  },
+  headerTitle: { fontSize: "17px", fontWeight: "800", color: "#fff", lineHeight: 1.3 },
+  headerCompany: { fontSize: "13px", fontWeight: "600", color: "rgba(255,255,255,0.85)", marginTop: "4px" },
+  body: {
+    flex: 1,
+    overflowY: "auto",
+    padding: "20px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "20px",
+  },
+  // 2-column grid of icon + label/value "facts" — scans faster than a row of chips.
+  factsGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, 1fr)",
+    gap: "16px 20px",
+  },
+  fact: { display: "flex", alignItems: "flex-start", gap: "8px" },
+  factIcon: { fontSize: "15px", lineHeight: "20px", flexShrink: 0 },
+  factLabel: {
+    fontSize: "10.5px",
+    fontWeight: "700",
+    color: "#9ca3af",
+    textTransform: "uppercase",
+    letterSpacing: "0.4px",
+  },
+  factValue: { fontSize: "13.5px", fontWeight: "600", color: "#1f2937", marginTop: "1px" },
+  sectionLabel: {
+    fontSize: "11px",
+    fontWeight: "700",
+    color: "#6b7280",
+    textTransform: "uppercase",
+    letterSpacing: "0.5px",
+    marginBottom: "8px",
+  },
+  descriptionBox: {
+    fontSize: "13.5px",
+    lineHeight: 1.7,
+    color: "#374151",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    background: "#f9fafb",
+    border: "1px solid #f3f4f6",
+    borderRadius: "12px",
+    padding: "14px 16px",
+  },
+  previewHint: {
+    marginTop: "8px",
+    fontSize: "12px",
+    color: "#6b7280",
+    lineHeight: 1.5,
+  },
+  actions: {
+    display: "flex",
+    gap: "10px",
+    padding: "16px 20px",
+    borderTop: "1px solid #f3f4f6",
+    flexShrink: 0,
+  },
+};
+
+// ── Tailor-my-resume modal styles ────────────────────────────────────────────
+const tailorStyles = {
+  lead: {
+    margin: 0,
+    fontSize: "14px",
+    lineHeight: 1.6,
+    color: "#374151",
+  },
+  error: {
+    margin: 0,
+    fontSize: "13px",
+    color: "#991b1b",
+    background: "#fee2e2",
+    border: "1px solid #fecaca",
+    borderRadius: "10px",
+    padding: "8px 12px",
+  },
+  note: {
+    fontSize: "12.5px",
+    lineHeight: 1.5,
+    color: "#065f46",
+    background: "#f0fdf4",
+    border: "1px solid #dcfce7",
+    borderRadius: "10px",
+    padding: "9px 12px",
+  },
+  resumeBox: {
+    margin: 0,
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontSize: "12.5px",
+    lineHeight: 1.65,
+    color: "#1f2937",
+    background: "#f9fafb",
+    border: "1px solid #f3f4f6",
+    borderRadius: "12px",
+    padding: "14px 16px",
+  },
+  textLink: {
+    alignSelf: "flex-start",
+    background: "none",
+    border: "none",
+    padding: 0,
+    fontSize: "12px",
+    color: "#7c3aed",
+    textDecoration: "underline",
+    cursor: "pointer",
+  },
+  spinner: {
+    width: "40px",
+    height: "40px",
+    borderWidth: "4px",
+    borderStyle: "solid",
+    borderColor: "#e5e7eb #e5e7eb #e5e7eb #7c3aed",
+    borderRadius: "50%",
+    animation: "spin 0.9s linear infinite",
+    marginBottom: "16px",
+  },
+  loadingText: {
+    margin: 0,
+    textAlign: "center",
+    fontSize: "14px",
+    color: "#6b7280",
+    lineHeight: 1.6,
   },
 };

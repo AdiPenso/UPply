@@ -1,29 +1,39 @@
-// UPply — AI Career Coach chat panel
-// A floating sidebar that lets the user chat with an OpenAI-powered career assistant.
-// The assistant knows the user's full profile (fetched by the Lambda from DynamoDB).
-// Conversation history is persisted in sessionStorage so it survives page navigation.
+// UPply — AI Career Agent chat panel
+// A floating sidebar that lets the user chat with an OpenAI-powered career agent.
+// The agent knows the user's full profile and can act on their behalf through
+// tools that invoke the other UPply Lambdas (search jobs, save/apply, edit
+// profile, analyse fit …). Conversation history is persisted in sessionStorage
+// so it survives page navigation.
+//
+// Props:
+//   userId        — Cognito sub of the signed-in user
+//   onDataChanged — optional callback fired after the agent changes stored data
+//                   (saved jobs, applications, profile), so the host page can refresh
 
 import { useState, useEffect, useRef } from "react";
 import { askAI } from "../services/api";
 
-const STORAGE_KEY = "upply_ai_chat";
+// Chat history is stored per-user so switching accounts in the same tab never
+// shows one user another user's conversation (and the agent never answers with
+// the wrong profile in context).
+const storageKey = (uid) => `upply_ai_chat_${uid || "anon"}`;
 const MAX_HISTORY = 12; // last 6 exchanges sent as context
 
+// Kept broad and profile-agnostic — every user sees the same prompts, and the
+// agent fills in the specifics (skills, target role, gaps) from their profile.
 const QUICK_PROMPTS = [
-  "How can I improve my profile?",
-  "What are my strongest skills?",
   "How should I prepare for interviews?",
+  "Find jobs that match my profile and save the best 3",
+  "Find remote jobs that fit my background",
   "What salary should I ask for?",
+  "What are my biggest strengths and gaps as a candidate?",
 ];
 
-export default function AIChatPanel({ userId }) {
+export default function AIChatPanel({ userId, onDataChanged }) {
   const [isOpen, setIsOpen]     = useState(false);
   const [input, setInput]       = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [messages, setMessages] = useState(() => {
-    try { return JSON.parse(sessionStorage.getItem(STORAGE_KEY) || "[]"); }
-    catch { return []; }
-  });
+  const [messages, setMessages] = useState([]);
 
   const bottomRef   = useRef(null);
   const inputRef    = useRef(null);
@@ -39,14 +49,23 @@ export default function AIChatPanel({ userId }) {
     if (isOpen) setTimeout(() => inputRef.current?.focus(), 300);
   }, [isOpen]);
 
-  // Persist to sessionStorage
+  // Load this user's own history whenever the account changes (login / switch /
+  // logout). A different user starts from their own slot, never the previous one.
   useEffect(() => {
-    try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(messages)); }
-    catch { /* storage full or unavailable — chat still works in-memory */ }
-  }, [messages]);
+    try { setMessages(JSON.parse(sessionStorage.getItem(storageKey(userId)) || "[]")); }
+    catch { setMessages([]); }
+  }, [userId]);
 
-  const addMessage = (role, content, isError = false) =>
-    setMessages(prev => [...prev, { role, content, isError }]);
+  // Persist to this user's slot only (skip while userId is still resolving, so we
+  // don't write the just-loaded history into the "anon" slot).
+  useEffect(() => {
+    if (!userId) return;
+    try { sessionStorage.setItem(storageKey(userId), JSON.stringify(messages)); }
+    catch { /* storage full or unavailable — chat still works in-memory */ }
+  }, [messages, userId]);
+
+  const addMessage = (role, content, isError = false, actions = []) =>
+    setMessages(prev => [...prev, { role, content, isError, actions }]);
 
   const send = async (text = input.trim()) => {
     if (!text || isLoading || !userId) return;
@@ -61,8 +80,10 @@ export default function AIChatPanel({ userId }) {
       .map(({ role, content }) => ({ role, content }));
 
     try {
-      const { reply } = await askAI(userId, text, history);
-      addMessage("assistant", reply);
+      const data = await askAI(userId, text, history);
+      addMessage("assistant", data.reply, false, data.actions_taken || []);
+      // If the agent changed stored data, let the host page refresh its view.
+      if (data.did_mutate && typeof onDataChanged === "function") onDataChanged();
     } catch {
       addMessage("assistant", "Sorry, I couldn't reach the AI service right now. Please try again in a moment.", true);
     } finally {
@@ -76,7 +97,7 @@ export default function AIChatPanel({ userId }) {
 
   const clearChat = () => {
     setMessages([]);
-    sessionStorage.removeItem(STORAGE_KEY);
+    try { sessionStorage.removeItem(storageKey(userId)); } catch { /* ignore */ }
   };
 
   return (
@@ -106,8 +127,8 @@ export default function AIChatPanel({ userId }) {
           <div style={s.headerLeft}>
             <div style={s.headerAvatar}>🤖</div>
             <div>
-              <div style={s.headerTitle}>AI Career Coach</div>
-              <div style={s.headerSub}>● Online · Powered by GPT</div>
+              <div style={s.headerTitle}>AI Career Agent</div>
+              <div style={s.headerSub}>● Online · Can act on your account</div>
             </div>
           </div>
           <div style={{ display: "flex", gap: "6px" }}>
@@ -125,9 +146,10 @@ export default function AIChatPanel({ userId }) {
           {messages.length === 0 && (
             <div style={s.welcome}>
               <div style={s.welcomeEmoji}>👋</div>
-              <div style={s.welcomeTitle}>Hi, I'm your Career Coach!</div>
+              <div style={s.welcomeTitle}>Hi, I'm your Career Agent!</div>
               <div style={s.welcomeBody}>
-                I know your profile and can give you personalized advice. Try one of these:
+                I know your profile and can search jobs, save or apply to them,
+                update your profile and analyse your fit — just ask. Try one of these:
               </div>
               <div style={s.chips}>
                 {QUICK_PROMPTS.map(p => (
@@ -139,27 +161,40 @@ export default function AIChatPanel({ userId }) {
 
           {/* Message bubbles */}
           {messages.map((msg, i) => (
-            <div key={i} style={msg.role === "user" ? s.userRow : s.aiRow}>
-              {msg.role === "assistant" && <div style={s.aiAvatar}>🤖</div>}
-              <div style={{
-                ...(msg.role === "user" ? s.userBubble : s.aiBubble),
-                ...(msg.isError ? s.errorBubble : {}),
-              }}>
-                {msg.role === "user"
-                  ? msg.content
-                  : <MarkdownMessage text={msg.content} />}
+            msg.role === "user" ? (
+              <div key={i} style={s.userRow}>
+                <div style={s.userBubble}>{msg.content}</div>
               </div>
-            </div>
+            ) : (
+              <div key={i} style={s.aiRow}>
+                <div style={s.aiAvatar}>🤖</div>
+                <div style={s.aiCol}>
+                  {msg.actions?.length > 0 && (
+                    <div style={s.actionTrace}>
+                      {msg.actions.map((a, j) => (
+                        <div key={j} style={s.actionItem}>
+                          <span style={s.actionCheck}>✓</span> {a}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ ...s.aiBubble, ...(msg.isError ? s.errorBubble : {}) }}>
+                    <MarkdownMessage text={msg.content} />
+                  </div>
+                </div>
+              </div>
+            )
           ))}
 
           {/* Typing indicator */}
           {isLoading && (
             <div style={s.aiRow}>
               <div style={s.aiAvatar}>🤖</div>
-              <div style={s.aiBubble}>
+              <div style={{ ...s.aiBubble, display: "flex", alignItems: "center", gap: "8px" }}>
                 <span className="ai-dot" />
                 <span className="ai-dot" />
                 <span className="ai-dot" />
+                <span style={{ fontSize: "11px", color: "#9ca3af" }}>working…</span>
               </div>
             </div>
           )}
@@ -196,75 +231,128 @@ export default function AIChatPanel({ userId }) {
 
 // ── Markdown renderer ─────────────────────────────────────────────────────────
 // Renders GPT-style markdown without any external dependency.
-// Handles: **bold**, bullet lists (- / • / *), numbered lists, ### headers.
+// Handles: **bold**, [label](url) + bare links, bullet lists (- / • / *,
+// including one level of nesting), numbered lists, ### headers.
+
+const linkStyle = {
+  color: "#7c3aed",
+  fontWeight: 600,
+  textDecoration: "underline",
+  wordBreak: "break-all",
+};
+
+// Show a long tracking URL as just its host so it doesn't blow out the bubble.
+function prettyUrl(u) {
+  try {
+    return new URL(u).hostname.replace(/^www\./, "") + " ↗";
+  } catch {
+    return u.length > 40 ? u.slice(0, 40) + "…" : u;
+  }
+}
 
 function inlineFmt(text) {
-  // Split on **bold** patterns and render them
-  return text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
-    part.startsWith("**") && part.endsWith("**")
-      ? <strong key={i}>{part.slice(2, -2)}</strong>
-      : part
-  );
+  // Tokenise on **bold**, [label](url) and bare http(s) URLs.
+  const re = /(\*\*[^*]+\*\*)|(\[[^\]]+\]\(https?:\/\/[^\s)]+\))|(https?:\/\/[^\s)]+)/g;
+  const parts = [];
+  let last = 0;
+  let i = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    const tok = m[0];
+    if (m[1]) {
+      parts.push(<strong key={i++}>{tok.slice(2, -2)}</strong>);
+    } else if (m[2]) {
+      const label = tok.slice(1, tok.indexOf("]"));
+      const url = tok.slice(tok.indexOf("(") + 1, -1);
+      parts.push(
+        <a key={i++} href={url} target="_blank" rel="noopener noreferrer" style={linkStyle}>{label}</a>
+      );
+    } else {
+      parts.push(
+        <a key={i++} href={tok} target="_blank" rel="noopener noreferrer" style={linkStyle}>{prettyUrl(tok)}</a>
+      );
+    }
+    last = m.index + tok.length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
 }
 
 function MarkdownMessage({ text }) {
   const lines  = text.split("\n");
   const output = [];
-  let listItems   = [];
-  let listType    = null; // "ul" | "ol"
+  let items    = [];    // [{ text, sub }] — buffered list items
+  let listType = null;  // "ul" | "ol"
   let k = 0;
 
+  // Render the buffered list as ONE <ol>/<ul>. Keeping every item in a single
+  // list is what makes an ordered list count 1, 2, 3 — the browser numbers by
+  // position and ignores whatever digits the model wrote.
   const flushList = () => {
-    if (!listItems.length) return;
-    const Tag = listType === "ol" ? "ol" : "ul";
-    output.push(
-      <Tag key={k++} style={{ margin: "4px 0", paddingLeft: "18px" }}>
-        {listItems}
-      </Tag>
-    );
-    listItems = [];
-    listType  = null;
+    if (items.length) {
+      const Tag = listType === "ol" ? "ol" : "ul";
+      output.push(
+        <Tag key={k++} style={{ margin: "6px 0", paddingLeft: "22px" }}>
+          {items.map((it, i) => (
+            <li key={i} style={{
+              marginBottom: "4px",
+              lineHeight: "1.5",
+              marginLeft: it.sub ? "14px" : 0,
+              listStyleType: it.sub ? "circle" : undefined,
+            }}>
+              {inlineFmt(it.text)}
+            </li>
+          ))}
+        </Tag>
+      );
+    }
+    items = [];
+    listType = null;
   };
 
   lines.forEach((raw) => {
     const line = raw.trimEnd();
+    const trimmed = line.trimStart();
 
-    // Unordered bullet: "- text" or "• text" or "* text"
-    if (/^[-•*]\s/.test(line.trimStart())) {
-      listType = "ul";
-      listItems.push(
-        <li key={k++} style={{ marginBottom: "3px", lineHeight: "1.5" }}>
-          {inlineFmt(line.replace(/^[-•*]\s/, "").trim())}
-        </li>
-      );
+    // Blank line: a spacer between paragraphs, but INSIDE a list just keep the
+    // list open (don't split it into one <ol> per item).
+    if (!trimmed) {
+      if (!items.length) output.push(<div key={k++} style={{ height: "6px" }} />);
       return;
     }
 
-    // Ordered list: "1. text"
-    if (/^\d+\.\s/.test(line.trimStart())) {
-      listType = "ol";
-      listItems.push(
-        <li key={k++} style={{ marginBottom: "3px", lineHeight: "1.5" }}>
-          {inlineFmt(line.replace(/^\d+\.\s/, "").trim())}
-        </li>
-      );
+    const ul = trimmed.match(/^[-•*]\s+(.*)$/);
+    const ol = trimmed.match(/^\d+[.)]\s+(.*)$/);
+
+    if (ul || ol) {
+      const wantType = ol ? "ol" : "ul";
+      if (listType && listType !== wantType) flushList();
+      listType = wantType;
+
+      let content = (ul ? ul[1] : ol[1]).trim();
+      let sub = /^\s+/.test(raw);                 // indented item
+      const nested = content.match(/^[-•*]\s+(.*)$/); // model flattened "* - text"
+      if (nested) { content = nested[1].trim(); sub = true; }
+
+      items.push({ text: content, sub });
       return;
     }
 
+    // Indented line while a list is open → continuation of the last item.
+    if (items.length && /^\s+\S/.test(raw)) {
+      items[items.length - 1].text += " " + trimmed;
+      return;
+    }
+
+    // Anything else closes the list.
     flushList();
-
-    // Blank line → small spacer
-    if (!line.trim()) {
-      output.push(<div key={k++} style={{ height: "6px" }} />);
-      return;
-    }
 
     // Heading: # / ## / ###
     if (/^#{1,3}\s/.test(line)) {
-      const content = line.replace(/^#{1,3}\s/, "");
       output.push(
         <div key={k++} style={{ fontWeight: "700", fontSize: "13.5px", marginTop: "8px", marginBottom: "3px" }}>
-          {inlineFmt(content)}
+          {inlineFmt(line.replace(/^#{1,3}\s/, ""))}
         </div>
       );
       return;
@@ -272,8 +360,8 @@ function MarkdownMessage({ text }) {
 
     // Regular paragraph line
     output.push(
-      <div key={k++} style={{ lineHeight: "1.6", marginBottom: "1px" }}>
-        {inlineFmt(line.trim())}
+      <div key={k++} style={{ lineHeight: "1.6", marginBottom: "2px" }}>
+        {inlineFmt(trimmed)}
       </div>
     );
   });
@@ -425,6 +513,32 @@ const s = {
     display: "flex",
     alignItems: "flex-end",
     gap: "8px",
+  },
+  aiCol: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px",
+    maxWidth: "82%",
+  },
+  actionTrace: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "2px",
+    background: "#f5f3ff",
+    border: "1px solid #ede9fe",
+    borderRadius: "12px",
+    padding: "6px 10px",
+  },
+  actionItem: {
+    fontSize: "11px",
+    color: "#6d28d9",
+    fontWeight: "600",
+    lineHeight: 1.4,
+  },
+  actionCheck: {
+    color: "#10b981",
+    fontWeight: "800",
+    marginRight: "2px",
   },
   aiAvatar: {
     width: "28px",

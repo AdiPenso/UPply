@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import Header from "../components/Header.jsx";
 import { signIn, signOut, fetchAuthSession } from "aws-amplify/auth";
 import { getProfile } from "../services/api";
+import { clearUserSessionData } from "../utils/authCleanup";
 
 function LoginPage() {
   const [email, setEmail] = useState("");
@@ -19,6 +20,7 @@ function LoginPage() {
 
     try {
       await signOut();
+      clearUserSessionData();
 
       await signIn({
         username: email,
