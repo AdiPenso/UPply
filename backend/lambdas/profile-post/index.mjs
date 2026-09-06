@@ -41,7 +41,9 @@ export const handler = async (event) => {
   if (!first_name) { log("warn", "Missing first_name"); return bad("Missing first_name"); }
   if (!last_name)  { log("warn", "Missing last_name");  return bad("Missing last_name"); }
 
-  log("info", "Creating new profile", { user_id, email, first_name, last_name });
+  // Log only the (pseudonymous) user_id — email and name are PII and must not
+  // land in CloudWatch. has_* flags keep the log useful without the values.
+  log("info", "Creating new profile", { user_id, has_phone: !!phone, has_location: !!location });
 
   const item = {
     user_id,
@@ -57,7 +59,7 @@ export const handler = async (event) => {
 
   try {
     await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
-    log("info", "Profile created successfully", { user_id, email });
+    log("info", "Profile created successfully", { user_id });
     return ok({ ok: true, profile: item });
   } catch (err) {
     log("error", "profile-post failed", { user_id, error: err.message });
