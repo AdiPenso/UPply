@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchAuthSession, signOut } from "aws-amplify/auth";
 import logo from "../assets/Logo.png";
@@ -13,6 +13,13 @@ import AIChatPanel from "../components/AIChatPanel.jsx";
 // Cache expires after 5 minutes to avoid showing very stale jobs.
 const JOBS_CACHE_KEY = "upply_jobs_cache";
 const JOBS_CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+// The home feed's opening search. Location defaults to Israel so the first
+// results come from CareerJet (fast, local) instead of a slow, US-centric
+// JSearch query; once the profile loads, initPage re-runs this once with the
+// user's own target role and location.
+const DEFAULT_KW = "software engineer";
+const DEFAULT_LOC = "Israel";
 
 function readJobsCache() {
   try {
@@ -61,8 +68,8 @@ export default function HomePage() {
   // Pagination
   const [page, setPage] = useState(() => warmCache?.page ?? 1);
   const [hasMore, setHasMore] = useState(() => warmCache?.hasMore ?? false);
-  const [searchedKw, setSearchedKw] = useState(() => warmCache?.kw ?? "software developer");
-  const [searchedLoc, setSearchedLoc] = useState(() => warmCache?.loc ?? "");
+  const [searchedKw, setSearchedKw] = useState(() => warmCache?.kw ?? DEFAULT_KW);
+  const [searchedLoc, setSearchedLoc] = useState(() => warmCache?.loc ?? DEFAULT_LOC);
 
   // Apply confirmation modal ("did you submit?")
   const [applyModal, setApplyModal] = useState(null); // job object or null
@@ -78,6 +85,11 @@ export default function HomePage() {
   const [analyzeModal, setAnalyzeModal] = useState(null);
 
   const navigate = useNavigate();
+
+  // Flips true the moment the user runs their own search or pages the feed, so
+  // the one-time "personalise the opening feed from the profile" step in
+  // initPage doesn't yank the results out from under them.
+  const userSearchedRef = useRef(false);
 
   // Run once on mount.
   useEffect(() => {
@@ -131,6 +143,19 @@ export default function HomePage() {
       if (Array.isArray(activity?.saved)) {
         setSavedJobs(new Set(activity.saved.map((j) => j.job_url)));
       }
+
+      // Refine the opening feed to the user's own target role + location — once,
+      // and only if they haven't already searched or paged the feed themselves.
+      if (!warmCache && !userSearchedRef.current && profile) {
+        const kw = String(profile.desired_role || profile.title || DEFAULT_KW).trim();
+        const loc = String(profile.location || DEFAULT_LOC).trim();
+        if (kw !== searchedKw || loc !== searchedLoc) {
+          setSearchedKw(kw);
+          setSearchedLoc(loc);
+          setPage(1);
+          searchJobs(kw, loc, 1);
+        }
+      }
     } catch (err) {
       console.warn("Could not load profile:", err);
     }
@@ -147,7 +172,7 @@ export default function HomePage() {
       writeJobsCache(kw, loc, pg, results, more);
     } catch (err) {
       console.error("Job fetch error:", err);
-      setError(err.message || "Could not load jobs.");
+      setError("We couldn't load jobs right now — try again in a moment, or adjust your search.");
       setJobs([]);
       setHasMore(false);
     } finally {
@@ -156,7 +181,8 @@ export default function HomePage() {
   };
 
   const handleSearch = () => {
-    const kw = keywords || "software developer";
+    userSearchedRef.current = true;
+    const kw = keywords || DEFAULT_KW;
     setSearchedKw(kw);
     setSearchedLoc(location);
     setPage(1);
@@ -168,6 +194,7 @@ export default function HomePage() {
   };
 
   const handlePrevPage = () => {
+    userSearchedRef.current = true;
     const p = Math.max(1, page - 1);
     setPage(p);
     searchJobs(searchedKw, searchedLoc, p);
@@ -175,6 +202,7 @@ export default function HomePage() {
   };
 
   const handleNextPage = () => {
+    userSearchedRef.current = true;
     const p = page + 1;
     setPage(p);
     searchJobs(searchedKw, searchedLoc, p);

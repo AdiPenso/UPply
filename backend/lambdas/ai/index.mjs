@@ -855,6 +855,11 @@ Formatting:
   const toolTrace    = [];   // [{ tool, ok }]
   let broadSearchDone = false; // find_matching_jobs is expensive — run it once
 
+  // Every job surfaced this turn, keyed by url. Used to backfill a title/company
+  // the model forgot to pass to save_job / track_application — without it those
+  // calls store a blank "Untitled position" row.
+  const jobIndex = new Map();
+
   // Collapse repeated identical trace lines (e.g. two near-identical searches).
   const traceLabels = () => {
     const out = [];
@@ -885,6 +890,18 @@ Formatting:
       let args = {};
       try { args = JSON.parse(tc.function.arguments || "{}"); } catch { /* keep {} */ }
 
+      // Backfill a title/company the model dropped when saving/applying to a job
+      // it just searched — matched on the exact job_url from the search results.
+      if (
+        ["save_job", "unsave_job", "track_application"].includes(tc.function.name) &&
+        args.job_url && !args.title && jobIndex.has(args.job_url)
+      ) {
+        const j = jobIndex.get(args.job_url);
+        args.title    = j.title    || args.title;
+        args.company  = j.company  || args.company;
+        args.location = j.location || args.location;
+      }
+
       // find_matching_jobs fans out many sub-searches; a second call in the same
       // turn roughly doubles latency for little gain. Allow it only if the first
       // one came back nearly empty.
@@ -910,6 +927,14 @@ Formatting:
 
       if (tc.function.name === "find_matching_jobs" && success && (result.count || 0) >= 3) {
         broadSearchDone = true;
+      }
+
+      // Remember the jobs from this search so a later save/apply that omits the
+      // title can still be completed with the right title/company.
+      if (success && (tc.function.name === "search_jobs" || tc.function.name === "find_matching_jobs")) {
+        for (const j of (result.jobs || [])) {
+          if (j && j.url) jobIndex.set(j.url, j);
+        }
       }
 
       toolTrace.push({ tool: tc.function.name, ok: success });

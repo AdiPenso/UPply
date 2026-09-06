@@ -99,6 +99,12 @@ export const handler = async (event) => {
         (identity && identityOf(r.job_title, r.company) === identity)
       );
 
+      // A save with no title and no row to attach to would store a blank
+      // "Untitled position" — reject it so the caller retries with a title.
+      if (!job.title && !match) {
+        return bad("Missing job.title — a saved job needs a title");
+      }
+
       const activity_id = match?.activity_id
         || `save#${encodeUrl(identity || job.job_url)}`;
 

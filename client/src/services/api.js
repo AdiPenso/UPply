@@ -4,12 +4,27 @@
 
 import { API_BASE_URL } from "../aws/config";
 
+// ── Error handling ────────────────────────────────────────────────────────────
+// The backend returns JSON like {"error":"Missing user_id"} on failure. That
+// text is useful in the console but must never reach the UI — pages surface
+// err.message directly. `fail()` logs the real status + body and throws an
+// Error carrying only a friendly, user-safe message.
+async function fail(res, label, friendly) {
+  let detail = "";
+  try { detail = await res.text(); } catch { /* body already consumed / unreadable */ }
+  console.error(`[api] ${label} → HTTP ${res.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`);
+  return new Error(friendly);
+}
+
+const GENERIC = "Something went wrong. Please try again in a moment.";
+const AI_DOWN = "The AI service is busy right now. Please try again in a moment.";
+
 // ── Profile ───────────────────────────────────────────────────────────────────
 
 // Check if a user profile exists. Returns { exists, ...profileFields }
 export const getProfile = async (userId) => {
   const res = await fetch(`${API_BASE_URL}/profile?user_id=${userId}`);
-  if (!res.ok) throw new Error(`getProfile failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "getProfile", "We couldn't load your profile. Please try again.");
   return res.json();
 };
 
@@ -20,7 +35,7 @@ export const createProfile = async (data) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error(`createProfile failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "createProfile", "We couldn't save your profile. Please try again.");
   return res.json();
 };
 
@@ -31,10 +46,7 @@ export const updateProfile = async (userId, fields) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, ...fields }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`HTTP ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "updateProfile", "We couldn't save your changes. Please try again.");
   return res.json();
 };
 
@@ -48,9 +60,14 @@ const jobsInFlight = new Map();
 
 // Search jobs. Lambda routes to CareerJet (Israel) or JSearch (everywhere else).
 // Returns { jobs: [...], hasMore: bool } — fetches one page of 10 at a time.
-// Retries a 5xx / network error a few times with backoff: a 503 here is almost
-// always API Gateway throttling the Lambda (it comes back in <1s), so a short
-// wait and another try usually lands on a free execution slot.
+// Retries a 5xx / network error / timeout a few times with backoff: a 503 here
+// is almost always API Gateway throttling the Lambda (it comes back in <1s), so
+// a short wait and another try usually lands on a free execution slot. Each
+// attempt is capped at 15s by an AbortController so a hung upstream (JSearch can
+// stall for 20-30s when its free-tier quota is throttled) never leaves the feed
+// spinning forever.
+const JOBS_TIMEOUT_MS = 15000;
+
 export const fetchJobs = async (keywords, location, page = 1) => {
   const params = new URLSearchParams();
   if (keywords) params.set("keywords", keywords);
@@ -68,8 +85,10 @@ export const fetchJobs = async (keywords, location, page = 1) => {
         // small jitter so retries from double-fired effects don't collide again
         await new Promise((r) => setTimeout(r, delays[i] + Math.random() * 400));
       }
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), JOBS_TIMEOUT_MS);
       try {
-        const res = await fetch(url);
+        const res = await fetch(url, { signal: ctrl.signal });
         if (res.ok) {
           const data = await res.json();
           return {
@@ -83,8 +102,10 @@ export const fetchJobs = async (keywords, location, page = 1) => {
         console.warn(`Jobs API ${res.status} — retrying (attempt ${i + 1}/${delays.length})`);
       } catch (err) {
         if (/Jobs API error 4\d\d/.test(err.message)) throw err;
-        lastErr = err;
+        lastErr = err.name === "AbortError" ? new Error("Jobs request timed out") : err;
         console.warn(`Jobs fetch failed — retrying (attempt ${i + 1}/${delays.length}):`, err.message);
+      } finally {
+        clearTimeout(timer);
       }
     }
     throw lastErr || new Error("Jobs API unavailable");
@@ -103,7 +124,7 @@ export const fetchJobs = async (keywords, location, page = 1) => {
 // Get all saved and applied jobs for a user.
 export const getActivity = async (userId) => {
   const res = await fetch(`${API_BASE_URL}/activity?user_id=${userId}`);
-  if (!res.ok) throw new Error(`getActivity failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "getActivity", "We couldn't load your activity. Please try again.");
   return res.json();
 };
 
@@ -123,7 +144,7 @@ export const postActivity = async (userId, action, job) => {
       },
     }),
   });
-  if (!res.ok) throw new Error(`postActivity failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "postActivity", "We couldn't save that. Please try again.");
   return res.json();
 };
 
@@ -135,7 +156,7 @@ export const updateActivityStatus = async (userId, activityId, status) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, action: "update_status", activity_id: activityId, status }),
   });
-  if (!res.ok) throw new Error(`updateActivityStatus failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "updateActivityStatus", "We couldn't update the status. Please try again.");
   return res.json();
 };
 
@@ -146,7 +167,7 @@ export const deleteActivity = async (userId, activityId) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, action: "delete", activity_id: activityId }),
   });
-  if (!res.ok) throw new Error(`deleteActivity failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "deleteActivity", "We couldn't remove that item. Please try again.");
   return res.json();
 };
 
@@ -160,7 +181,7 @@ export const getUploadUrl = async (userId, fileName) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, file_name: fileName }),
   });
-  if (!res.ok) throw new Error(`getUploadUrl failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "getUploadUrl", "We couldn't start the upload. Please try again.");
   return res.json();
 };
 
@@ -172,13 +193,13 @@ export const uploadFileToS3 = async (presignedUrl, file) => {
     headers: { "Content-Type": "application/pdf" },
     body: file,
   });
-  if (!res.ok) throw new Error(`S3 upload failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "uploadFileToS3", "The file upload failed. Please try again.");
 };
 
 // List all CVs for a user. Returns { documents: [...] }
 export const getDocuments = async (userId) => {
   const res = await fetch(`${API_BASE_URL}/documents?action=list&user_id=${userId}`);
-  if (!res.ok) throw new Error(`getDocuments failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "getDocuments", "We couldn't load your CVs. Please try again.");
   return res.json();
 };
 
@@ -197,7 +218,7 @@ export const saveDocument = async (userId, { docId, s3Key, fileName, cvText, isP
       is_primary: isPrimary,
     }),
   });
-  if (!res.ok) throw new Error(`saveDocument failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "saveDocument", "We couldn't save your CV details. Please try again.");
   return res.json();
 };
 
@@ -208,7 +229,7 @@ export const setPrimaryDocument = async (userId, docId) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, action: "set_primary", doc_id: docId }),
   });
-  if (!res.ok) throw new Error(`setPrimaryDocument failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "setPrimaryDocument", "We couldn't update your primary CV. Please try again.");
   return res.json();
 };
 
@@ -219,7 +240,7 @@ export const deleteDocument = async (userId, docId) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, action: "delete", doc_id: docId }),
   });
-  if (!res.ok) throw new Error(`deleteDocument failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "deleteDocument", "We couldn't delete that CV. Please try again.");
   return res.json();
 };
 
@@ -228,7 +249,7 @@ export const getDownloadUrl = async (userId, docId) => {
   const res = await fetch(
     `${API_BASE_URL}/documents?action=download_url&user_id=${userId}&doc_id=${encodeURIComponent(docId)}`
   );
-  if (!res.ok) throw new Error(`getDownloadUrl failed: ${res.status}`);
+  if (!res.ok) throw await fail(res, "getDownloadUrl", "We couldn't generate a download link. Please try again.");
   return res.json();
 };
 
@@ -243,10 +264,7 @@ export const askAI = async (userId, message, history = []) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, mode: "chat", message, history }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`AI service error ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "askAI", AI_DOWN);
   return res.json();
 };
 
@@ -259,10 +277,7 @@ export const extractCV = async (userId, cvText) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, mode: "extract_cv", cv_text: cvText }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`CV extraction error ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "extractCV", "We couldn't read that CV. Please try again.");
   return res.json();
 };
 
@@ -276,10 +291,7 @@ export const generateCoverLetter = async (userId, job, opts = {}) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, mode: "cover_letter", job, ...opts }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Cover letter error ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "generateCoverLetter", AI_DOWN);
   return res.json();
 };
 
@@ -292,10 +304,7 @@ export const tailorResume = async (userId, job) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, mode: "tailor_resume", job }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Resume tailoring error ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "tailorResume", AI_DOWN);
   return res.json();
 };
 
@@ -310,10 +319,7 @@ export const runInterviewTurn = async (userId, job, transcript = [], opts = {}) 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, mode: "interview", job, transcript, ...opts }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Interview error ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "runInterviewTurn", AI_DOWN);
   return res.json();
 };
 
@@ -325,10 +331,7 @@ export const synthesizeSpeech = async (text, voice) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mode: "tts", text, voice }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`TTS error ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "synthesizeSpeech", "Voice narration is unavailable right now.");
   return res.json();
 };
 
@@ -341,9 +344,6 @@ export const analyzeJobFit = async (userId, job) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ user_id: userId, mode: "analyze_job", job }),
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Analysis error ${res.status}: ${txt.slice(0, 120)}`);
-  }
+  if (!res.ok) throw await fail(res, "analyzeJobFit", AI_DOWN);
   return res.json();
 };
