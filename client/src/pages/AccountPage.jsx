@@ -1388,7 +1388,7 @@ export default function AccountPage() {
                 🔍 Find jobs
               </button>
               <button
-                style={{ ...styles.qaBtn, ...styles.qaBtnActive }}
+                style={styles.qaBtn}
                 onClick={() => {
                   setActiveTab("profile");
                   // Small delay to ensure the profile tab (and the file input) is mounted
@@ -2629,21 +2629,15 @@ const styles = {
     gap: "8px",
   },
   qaBtn: {
-    background: "#f9fafb",
-    border: "1px solid #e5e7eb",
+    background: "linear-gradient(135deg, #f3e8ff 0%, #cffafe 100%)",
+    border: "1px solid #ddd6fe",
     borderRadius: "10px",
     padding: "10px 12px",
     fontSize: "12px",
     fontWeight: "600",
-    color: "#374151",
-    cursor: "pointer",
-    textAlign: "left",
-  },
-  qaBtnActive: {
-    background: "linear-gradient(135deg, #f3e8ff 0%, #cffafe 100%)",
-    border: "1px solid #ddd6fe",
     color: "#5b21b6",
     cursor: "pointer",
+    textAlign: "left",
   },
   qaNote: {
     fontSize: "11px",
